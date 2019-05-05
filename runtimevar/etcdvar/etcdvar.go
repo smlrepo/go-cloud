@@ -237,10 +237,10 @@ func equivalentError(err1, err2 error) bool {
 	}
 	var code1, code2 codes.Code
 	if etcdErr, ok := err1.(rpctypes.EtcdError); ok {
-		code1 = etcdErr.Code()
+		code1 = (codes.Code)(etcdErr.Code())
 	}
 	if etcdErr, ok := err2.(rpctypes.EtcdError); ok {
-		code2 = etcdErr.Code()
+		code2 = (codes.Code)(etcdErr.Code())
 	}
 	return code1 != codes.OK && code1 == code2
 }
