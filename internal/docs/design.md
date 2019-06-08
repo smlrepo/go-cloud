@@ -89,7 +89,7 @@ This has a number of benefits:
     result to the driver type.
 -   Methods can be added to the portable type without breaking compatibility.
     Contrast with adding methods to an interface, which is a breaking change.
--   As new operations on the driver are added as new optional interfaces, the
+-   When new operations on the driver are added as new optional interfaces, the
     portable type can hide the need for type-assertions from the user.
 
 As a rule, if a method `Foo` has the same inputs and semantics in the portable
@@ -203,6 +203,28 @@ with `foo.New(...)` and later add `foo.NewWithOptions(..., opts *Options)` if
 needed). However, this would result in inconsistent names over time (e.g., some
 packages would expose `New` with an `Options`, while others would expose
 `NewWithOptions`).
+
+### Compound IDs
+
+Many cloud providers have resource IDs that are made up of subcomponents in
+some well-defined syntax. For example, [GCP KMS key IDs][] take the form
+`projects/[PROJECT_ID]/locations/[LOCATION]/keyRings/[KEY_RING]/cryptoKeys/[KEY]`.
+We call these _compound IDs_.
+
+There are two broad compound ID usage patterns we have observed:
+
+1. Applications will keep resources in the same location, so the application
+   will build the ID from the subcomponents rather than passing the entire
+   resource ID around.
+2. Applications will pass a verbatim string from configuration down to the
+   API, since this is what was easily copy-pasteable from the cloud console UI.
+
+Go CDK constructors that take in compound IDs should take in a `string` with the
+full compound ID. Helper functions to build these compound IDs from
+subcomponents may be provided as needed. URL openers (described below) should
+prefer to use the full compound ID in their URL format.
+
+[GCP KMS key IDs]: https://cloud.google.com/kms/docs/object-hierarchy#key
 
 ### URLs
 
@@ -434,7 +456,7 @@ https://landing.google.com/sre/book/chapters/addressing-cascading-failures.html
 
 The Go CDK allows users to escape the abstraction as needed using `As`
 functions, described in more detail in the
-[top-level godoc](https://godoc.org/gocloud.dev#hdr-As). `As` functions take an
+[concept guide](https://gocloud.dev/concepts/as/). `As` functions take an
 `interface{}` and return a `bool`; they return `true` if the underlying concrete
 type could be converted into the type provided as the `interface{}`.
 

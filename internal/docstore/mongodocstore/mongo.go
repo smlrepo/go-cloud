@@ -21,19 +21,30 @@
 // variable "MONGO_SERVER_URL".
 // To customize the URL opener, or for more details on the URL format,
 // see URLOpener.
-// See https://godoc.org/gocloud.dev#hdr-URLs for background information.
+// See https://gocloud.dev/concepts/urls/ for background information.
+//
 //
 // As
 //
 // mongodocstore exposes the following types for As:
 // - Collection: *mongo.Collection
+// - ActionList.BeforeDo: *options.FindOptions, *options.InsertOneOptions,
+//   *options.ReplaceOptions, *options.UpdateOptions or *options.DeleteOptions
+// - Query.BeforeQuery: *options.FindOptions
 // - DocumentIterator: *mongo.Cursor
+// - Error: mongo.CommandError, mongo.BulkWriteError, mongo.BulkWriteException
 //
-// Docstore types not supported by the Go mongo client, go.mongodb.org/mongo-driver/mongo:
-// TODO(jba): write
 //
-// MongoDB types not supported by Docstore:
-// TODO(jba): write
+// Special Considerations
+//
+// MongoDB represents times to millisecond precision, while Go's time.Time type has
+// nanosecond precision. To save time.Times to MongoDB without loss of precision,
+// save the result of calling  UnixNano on the time.
+//
+// The official Go driver for MongoDB, go.mongodb.org/mongo-driver/mongo, lowercases
+// struct field names; other docstore drivers do not. This means that you have to choose
+// between interoperating with the MongoDB driver and interoperating with other docstore drivers.
+// See Options.LowercaseFields for more information.
 package mongodocstore // import "gocloud.dev/internal/docstore/mongodocstore"
 
 // MongoDB reference manual: https://docs.mongodb.com/manual
@@ -44,14 +55,10 @@ package mongodocstore // import "gocloud.dev/internal/docstore/mongodocstore"
 
 import (
 	"context"
-	"errors"
-	"fmt"
-	"net/url"
-	"os"
 	"strings"
-	"sync"
 
 	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 	"gocloud.dev/gcerrors"
@@ -59,38 +66,6 @@ import (
 	"gocloud.dev/internal/docstore/driver"
 	"gocloud.dev/internal/gcerr"
 )
-
-func init() {
-	docstore.DefaultURLMux().RegisterCollection(Scheme, new(defaultDialer))
-}
-
-// defaultDialer dials a default Mongo server based on the environment variable
-// MONGO_SERVER_URL.
-type defaultDialer struct {
-	init   sync.Once
-	opener *URLOpener
-	err    error
-}
-
-func (o *defaultDialer) OpenCollectionURL(ctx context.Context, u *url.URL) (*docstore.Collection, error) {
-	o.init.Do(func() {
-		serverURL := os.Getenv("MONGO_SERVER_URL")
-		if serverURL == "" {
-			o.err = errors.New("MONGO_SERVER_URL environment variable is not set")
-			return
-		}
-		client, err := Dial(ctx, serverURL)
-		if err != nil {
-			o.err = fmt.Errorf("failed to dial default Mongo server at %q: %v", serverURL, err)
-			return
-		}
-		o.opener = &URLOpener{Client: client}
-	})
-	if o.err != nil {
-		return nil, fmt.Errorf("open collection %s: %v", u, o.err)
-	}
-	return o.opener.OpenCollectionURL(ctx, u)
-}
 
 // Dial returns a new mongoDB client that is connected to the server URI.
 func Dial(ctx context.Context, uri string) (*mongo.Client, error) {
@@ -108,47 +83,6 @@ func Dial(ctx context.Context, uri string) (*mongo.Client, error) {
 	return client, nil
 }
 
-// Scheme is the URL scheme mongodocstore registers its URLOpener under on
-// docstore.DefaultMux.
-const Scheme = "mongo"
-
-// URLOpener opens URLs like "mongo://mydb/mycollection".
-// See https://docs.mongodb.com/manual/reference/limits/#naming-restrictions for
-// naming restrictions.
-//
-// The URL Host is used as the database name.
-// The URL Path is used as the collection name.
-//
-// No query parameters are supported.
-type URLOpener struct {
-	// A Client is a MongoDB client that performs operations on the db, must be
-	// non-nil.
-	Client *mongo.Client
-
-	// Options specifies the options to pass to OpenCollection.
-	Options Options
-}
-
-// OpenCollectionURL opens the Collection URL.
-func (o *URLOpener) OpenCollectionURL(ctx context.Context, u *url.URL) (*docstore.Collection, error) {
-	q := u.Query()
-	idField := q.Get("id_field")
-	q.Del("id_field")
-	for param := range q {
-		return nil, fmt.Errorf("open collection %s: invalid query parameter %q", u, param)
-	}
-
-	dbName := u.Host
-	if dbName == "" {
-		return nil, fmt.Errorf("open collection %s: URL must have a non-empty Host (database name)", u)
-	}
-	collName := strings.TrimPrefix(u.Path, "/")
-	if collName == "" {
-		return nil, fmt.Errorf("open collection %s: URL must have a non-empty Path (collection name)", u)
-	}
-	return OpenCollection(o.Client.Database(dbName).Collection(collName), idField, &o.Options)
-}
-
 type collection struct {
 	coll          *mongo.Collection
 	idField       string
@@ -158,8 +92,19 @@ type collection struct {
 }
 
 type Options struct {
-	// Lowercase all field names for document encoding, field selection, update modifications
-	// and queries.
+	// Lowercase all field names for document encoding, field selection, update
+	// modifications and queries.
+	//
+	// If false (the default), then struct fields and MongoDB document fields will
+	// have the same names. For example, a struct field F will correspond to a
+	// MongoDB document field "F". This setting matches the behavior of other
+	// docstore providers, making code portable across providers.
+	//
+	// If true, struct fields correspond to lower-cased MongoDB document fields. The
+	// struct field F will correspond to the MongoDB document field "f", for
+	// instance. Use this to make code that uses this package interoperate with code
+	// that uses the official Go client for MongoDB,
+	// go.mongodb.org/mongo-driver/mongo, which lowercases field names.
 	LowercaseFields bool
 }
 
@@ -209,67 +154,111 @@ func newCollection(mcoll *mongo.Collection, idField string, idFunc func(docstore
 	return c, nil
 }
 
+func (c *collection) Key(doc driver.Document) (interface{}, error) {
+	if c.idField != "" {
+		id, _ := doc.GetField(c.idField)
+		return id, nil // missing field is not an error
+	}
+	id := c.idFunc(doc.Origin)
+	if id == nil {
+		return nil, gcerr.Newf(gcerr.InvalidArgument, nil, "missing document key")
+	}
+	return id, nil
+}
+
+func (c *collection) RevisionField() string {
+	// TODO(jba): should this be the lowercased version?
+	return c.revisionField
+}
+
 // From https://docs.mongodb.com/manual/core/document: "The field name _id is
 // reserved for use as a primary key; its value must be unique in the collection, is
 // immutable, and may be of any type other than an array."
 const mongoIDField = "_id"
 
-// TODO(jba): use bulk RPCs.
 func (c *collection) RunActions(ctx context.Context, actions []*driver.Action, opts *driver.RunActionsOptions) driver.ActionListError {
-	if opts.Unordered {
-		panic("unordered unimplemented")
+	errs := make([]error, len(actions))
+	beforeGets, gets, writes, afterGets := driver.GroupActions(actions)
+	c.runGets(ctx, beforeGets, errs, opts)
+	ch := make(chan []error)
+	go func() { ch <- c.bulkWrite(ctx, writes, errs) }()
+	c.runGets(ctx, gets, errs, opts)
+	writeErrs := <-ch
+	c.runGets(ctx, afterGets, errs, opts)
+	alerr := driver.NewActionListError(errs)
+	for _, werr := range writeErrs {
+		alerr = append(alerr, indexedError{-1, werr})
 	}
-	for i, a := range actions {
-		if err := c.runAction(ctx, a); err != nil {
-			return driver.ActionListError{{i, err}}
+	return alerr
+}
+
+type indexedError = struct {
+	Index int
+	Err   error
+}
+
+func (c *collection) runGets(ctx context.Context, gets []*driver.Action, errs []error, opts *driver.RunActionsOptions) {
+	// TODO(shantuo): figure out a reasonable batch size, there is no hard limit on
+	// the item number or filter string length. The limit for bulk write batch size
+	// is 100,000.
+	for _, group := range driver.GroupByFieldPath(gets) {
+		c.bulkFind(ctx, group, errs, opts)
+	}
+}
+
+func (c *collection) bulkFind(ctx context.Context, gets []*driver.Action, errs []error, dopts *driver.RunActionsOptions) {
+	// errors need to be mapped to the actions' indices.
+	setErr := func(err error) {
+		for _, get := range gets {
+			if errs[get.Index] == nil {
+				errs[get.Index] = err
+			}
 		}
 	}
-	return nil
-}
 
-func (c *collection) runAction(ctx context.Context, action *driver.Action) error {
-	var err error
-	switch action.Kind {
-	case driver.Get:
-		err = c.get(ctx, action)
-
-	case driver.Create:
-		err = c.create(ctx, action)
-
-	case driver.Replace, driver.Put:
-		err = c.replace(ctx, action, action.Kind == driver.Put)
-
-	case driver.Delete:
-		err = c.delete(ctx, action)
-
-	case driver.Update:
-		err = c.update(ctx, action)
-
-	default:
-		err = gcerr.Newf(gcerr.Internal, nil, "bad action %+v", action)
+	opts := options.Find()
+	if len(gets[0].FieldPaths) > 0 {
+		opts.Projection = c.projectionDoc(gets[0].FieldPaths)
 	}
-	return err
-}
-
-func (c *collection) get(ctx context.Context, a *driver.Action) error {
-	id, err := c.docID(a.Doc)
+	ids := bson.A{}
+	idToAction := map[interface{}]*driver.Action{}
+	for _, a := range gets {
+		id, err := encodeValue(a.Key)
+		if err != nil {
+			errs[a.Index] = err
+		} else {
+			ids = append(ids, id)
+			idToAction[id] = a
+		}
+	}
+	if dopts.BeforeDo != nil {
+		if err := dopts.BeforeDo(driver.AsFunc(opts)); err != nil {
+			setErr(err)
+			return
+		}
+	}
+	cursor, err := c.coll.Find(ctx, bson.D{bson.E{Key: mongoIDField, Value: bson.D{{Key: "$in", Value: ids}}}}, opts)
 	if err != nil {
-		return err
+		setErr(err)
+		return
 	}
-	opts := options.FindOne()
-	if len(a.FieldPaths) > 0 {
-		opts.Projection = c.projectionDoc(a.FieldPaths)
+	defer cursor.Close(ctx)
+
+	found := make(map[*driver.Action]bool)
+	for cursor.Next(ctx) {
+		var m map[string]interface{}
+		if err := cursor.Decode(&m); err != nil {
+			continue
+		}
+		a := idToAction[m[mongoIDField]]
+		errs[a.Index] = decodeDoc(m, a.Doc, c.idField)
+		found[a] = true
 	}
-	res := c.coll.FindOne(ctx, bson.D{{"_id", id}}, opts)
-	if res.Err() != nil {
-		return res.Err()
+	for _, a := range gets {
+		if !found[a] {
+			errs[a.Index] = gcerr.Newf(gcerr.NotFound, nil, "item with key %v not found", a.Key)
+		}
 	}
-	var m map[string]interface{}
-	// TODO(jba): Benchmark the double decode to see if it's worth trying to avoid it.
-	if err := res.Decode(&m); err != nil {
-		return err
-	}
-	return decodeDoc(m, a.Doc, c.idField)
 }
 
 // Construct a mongo "projection document" from field paths.
@@ -289,63 +278,54 @@ func (c *collection) toMongoFieldPath(fp []string) string {
 	return strings.Join(fp, ".")
 }
 
-func (c *collection) create(ctx context.Context, a *driver.Action) error {
-	// See https://docs.mongodb.com/manual/reference/method/db.collection.insertOne
-	id, err := c.docID(a.Doc)
-	// If the user provides a function to get the ID rather than a field, then Create
-	// can't make a unique ID for a document that's missing one, because it doesn't
-	// know how to create it or where to store it in the original document.
-	if err != nil && c.idField == "" {
-		return err
+func sliceToLower(s []string) {
+	for i, e := range s {
+		s[i] = strings.ToLower(e)
 	}
-	mdoc, err := c.encodeDoc(a.Doc, id)
-	if err != nil {
-		return err
-	}
-	result, err := c.coll.InsertOne(ctx, mdoc)
-	if err != nil {
-		return err
-	}
-	if result.InsertedID == nil {
-		return nil
-	}
-	// Here, c.idField must be non-empty. If it were empty, then the ID returned by
-	// c.idFunc would be set in mdoc, so result.InsertedID would be nil.
-	return a.Doc.SetField(c.idField, result.InsertedID)
 }
 
-func (c *collection) replace(ctx context.Context, a *driver.Action, upsert bool) error {
-	// See https://docs.mongodb.com/manual/reference/method/db.collection.replaceOne
-	id, err := c.docID(a.Doc)
+func (c *collection) prepareCreate(a *driver.Action) (mdoc, createdID interface{}, rev string, err error) {
+	id := a.Key
+	if id == nil {
+		// Create a unique ID here. (The MongoDB Go client does this for us when calling InsertOne,
+		// but not for BulkWrite.)
+		id = primitive.NewObjectID()
+		createdID = id
+	} else {
+		id, err = encodeValue(id)
+		if err != nil {
+			return nil, nil, "", err
+		}
+	}
+	mdoc, rev, err = c.encodeDoc(a.Doc, id)
 	if err != nil {
-		return err
+		return nil, nil, "", err
 	}
-	mdoc, err := c.encodeDoc(a.Doc, id)
-	if err != nil {
-		return err
-	}
-	opts := options.Replace()
-	if upsert {
-		opts.SetUpsert(true) // Document will be created if it doesn't exist.
-	}
-	filter, id, _, err := c.makeFilter(a.Doc)
-	if err != nil {
-		return err
-	}
-	result, err := c.coll.ReplaceOne(ctx, filter, mdoc, opts)
-	if err != nil {
-		return err
-	}
-	if !upsert && result.MatchedCount == 0 {
-		return gcerr.Newf(gcerr.NotFound, nil, "document with ID %v does not exist", id)
-	}
-	return nil
+	return mdoc, createdID, rev, nil
 }
 
-func (c *collection) encodeDoc(doc driver.Document, id interface{}) (map[string]interface{}, error) {
+func (c *collection) prepareReplace(a *driver.Action) (filter bson.D, mdoc map[string]interface{}, rev string, err error) {
+	id, err := encodeValue(a.Key)
+	if err != nil {
+		return nil, nil, "", err
+	}
+	filter, _, err = c.makeFilter(id, a.Doc)
+	if err != nil {
+		return nil, nil, "", err
+	}
+	mdoc, rev, err = c.encodeDoc(a.Doc, id)
+	if err != nil {
+		return nil, nil, "", err
+	}
+	return filter, mdoc, rev, nil
+}
+
+// encodeDoc encodes doc and sets its ID to the encoded value id. It also creates a new revision and sets it.
+// It returns the encoded document and the new revision.
+func (c *collection) encodeDoc(doc driver.Document, id interface{}) (map[string]interface{}, string, error) {
 	mdoc, err := encodeDoc(doc, c.opts.LowercaseFields)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	if id != nil {
 		if c.idField != "" {
@@ -353,105 +333,241 @@ func (c *collection) encodeDoc(doc driver.Document, id interface{}) (map[string]
 		}
 		mdoc[mongoIDField] = id
 	}
-	mdoc[c.revisionField] = driver.UniqueString()
-	return mdoc, nil
+	rev := driver.UniqueString()
+	mdoc[c.revisionField] = rev
+	return mdoc, rev, nil
 }
 
-func (c *collection) delete(ctx context.Context, a *driver.Action) error {
-	filter, id, rev, err := c.makeFilter(a.Doc)
+func (c *collection) prepareUpdate(a *driver.Action) (filter bson.D, updateDoc map[string]bson.D, rev string, err error) {
+	id, err := encodeValue(a.Key)
 	if err != nil {
-		return err
+		return nil, nil, "", err
 	}
-	result, err := c.coll.DeleteOne(ctx, filter)
+	filter, _, err = c.makeFilter(id, a.Doc)
 	if err != nil {
-		return err
+		return nil, nil, "", err
 	}
-	if result.DeletedCount == 0 {
-		if rev == nil {
-			return nil
-		}
-		// Not sure if the document doesn't exist, or the revision is wrong. Distinguish the two.
-		res := c.coll.FindOne(ctx, bson.D{{"_id", id}})
-		if res.Err() != nil { // TODO(jba): distinguish between not found and other errors.
-			return gcerr.Newf(gcerr.NotFound, res.Err(), "document with ID %v does not exist", id)
-		}
-		return gcerr.Newf(gcerr.FailedPrecondition, nil, "document with ID %v does not have revision %v", id, rev)
+	updateDoc, rev, err = c.newUpdateDoc(a.Mods)
+	if err != nil {
+		return nil, nil, "", err
 	}
-	return err
+	return filter, updateDoc, rev, nil
 }
 
-func (c *collection) update(ctx context.Context, a *driver.Action) error {
+func (c *collection) newUpdateDoc(mods []driver.Mod) (map[string]bson.D, string, error) {
 	var (
 		sets   bson.D
 		unsets bson.D
+		incs   bson.D
 	)
-	for _, m := range a.Mods {
+	for _, m := range mods {
 		key := c.toMongoFieldPath(m.FieldPath)
 		if m.Value == nil {
 			unsets = append(unsets, bson.E{Key: key, Value: ""})
+		} else if inc, ok := m.Value.(driver.IncOp); ok {
+			val, err := encodeValue(inc.Amount)
+			if err != nil {
+				return nil, "", err
+			}
+			incs = append(incs, bson.E{Key: key, Value: val})
 		} else {
 			val, err := encodeValue(m.Value)
 			if err != nil {
-				return err
+				return nil, "", err
 			}
 			sets = append(sets, bson.E{Key: key, Value: val})
 		}
 	}
-	if len(sets) == 0 && len(unsets) == 0 {
-		// MongoDB returns an error if there are no updates, but docstore treats it
-		// as a no-op.
-		return nil
-	}
 	updateDoc := map[string]bson.D{}
-	updateDoc["$set"] = append(sets, bson.E{Key: c.revisionField, Value: driver.UniqueString()})
+	rev := driver.UniqueString()
+	updateDoc["$set"] = append(sets, bson.E{Key: c.revisionField, Value: rev})
 	if len(unsets) > 0 {
 		updateDoc["$unset"] = unsets
 	}
-	filter, id, _, err := c.makeFilter(a.Doc)
-	if err != nil {
-		return err
+	if len(incs) > 0 {
+		updateDoc["$inc"] = incs
 	}
-	result, err := c.coll.UpdateOne(ctx, filter, updateDoc)
-	if err != nil {
-		return err
-	}
-	if result.MatchedCount == 0 {
-		return gcerr.Newf(gcerr.NotFound, nil, "document with ID %v does not exist", id)
-	}
-	return nil
+	return updateDoc, rev, nil
 }
 
-func (c *collection) makeFilter(doc driver.Document) (filter bson.D, id, rev interface{}, err error) {
-	id, err = c.docID(doc)
-	if err != nil {
-		return nil, nil, nil, err
-	}
+// makeFilter constructs a filter using the given encoded id and the document's revision field, if any.
+func (c *collection) makeFilter(id interface{}, doc driver.Document) (filter bson.D, rev interface{}, err error) {
 	rev, err = doc.GetField(c.revisionField)
 	if err != nil && gcerrors.Code(err) != gcerrors.NotFound {
-		return nil, nil, nil, err
+		return nil, nil, err
 	}
 	// Only select the document with the given ID.
-	filter = bson.D{{"_id", id}}
+	filter = bson.D{bson.E{Key: "_id", Value: id}}
 	// If the given document has a revision, it must match the stored document.
 	if rev != nil {
 		filter = append(filter, bson.E{Key: c.revisionField, Value: rev})
 	}
-	return filter, id, rev, nil
+	return filter, rev, nil
 }
 
-func (c *collection) docID(doc driver.Document) (interface{}, error) {
-	if c.idField != "" {
-		id, err := doc.GetField(c.idField)
-		if err != nil {
-			return nil, gcerr.New(gcerr.InvalidArgument, err, 2, "document missing ID")
+// bulkWrite calls the Mongo driver's BulkWrite RPC in unordered mode with the
+// actions, which must be writes.
+// errs is the slice of errors indexed by the position of the action in the original
+// action list. bulkWrite populates this slice. In addition, bulkWrite returns a list
+// of errors that cannot be attributed to any single action.
+func (c *collection) bulkWrite(ctx context.Context, actions []*driver.Action, errs []error) []error {
+	var (
+		models          []mongo.WriteModel
+		modelActions    []*driver.Action // corresponding action for each model
+		newIDs          []interface{}    // new IDs for Create actions, corresponding to models slice
+		revs            []string         // new revisions, corresponding to models slice
+		nDeletes        int64
+		nNonCreateWrite int64 // total operations expected from Put, Replace and Update
+	)
+	for _, a := range actions {
+		var m mongo.WriteModel
+		var err error
+		var newID interface{}
+		var rev string
+		switch a.Kind {
+		case driver.Create:
+			m, newID, rev, err = c.newCreateModel(a)
+		case driver.Delete:
+			m, err = c.newDeleteModel(a)
+			if err == nil {
+				nDeletes++
+			}
+		case driver.Replace, driver.Put:
+			m, rev, err = c.newReplaceModel(a, a.Kind == driver.Put)
+			if err == nil {
+				nNonCreateWrite++
+			}
+		case driver.Update:
+			m, rev, err = c.newUpdateModel(a)
+			if err == nil && m != nil {
+				nNonCreateWrite++
+			}
+		default:
+			err = gcerr.Newf(gcerr.Internal, nil, "bad action %+v", a)
 		}
-		return id, nil
+		if err != nil {
+			errs[a.Index] = err
+		} else if m != nil { // m can be nil for a no-op update
+			models = append(models, m)
+			modelActions = append(modelActions, a)
+			newIDs = append(newIDs, newID)
+			revs = append(revs, rev)
+		}
 	}
-	id := c.idFunc(doc.Origin)
-	if id == nil {
-		return nil, gcerr.New(gcerr.InvalidArgument, nil, 2, "document missing ID")
+	if len(models) == 0 {
+		return nil
 	}
-	return id, nil
+	// TODO(jba): improve independent execution. I think that even if BulkWrite returns an error,
+	// some of the actions may have succeeded.
+	var reterrs []error
+	res, err := c.coll.BulkWrite(ctx, models, options.BulkWrite().SetOrdered(false))
+	if err != nil {
+		bwe, ok := err.(mongo.BulkWriteException)
+		if !ok { // assume everything failed with this error
+			return []error{err}
+		}
+		// The returned indexes of the WriteErrors are wrong. See https://jira.mongodb.org/browse/GODRIVER-1028.
+		// Until it's fixed, use negative values for the indexes in the errors we return.
+		for _, w := range bwe.WriteErrors {
+			reterrs = append(reterrs, gcerr.Newf(translateMongoCode(w.Code), w, "%s", w.Message))
+		}
+		return reterrs
+	}
+	for i, newID := range newIDs {
+		if newID == nil {
+			continue
+		}
+		a := modelActions[i]
+		if err := a.Doc.SetField(c.idField, newID); err != nil {
+			errs[a.Index] = err
+		}
+	}
+	for i, rev := range revs {
+		if rev != "" {
+			// Ignore error, because document may not have a revision field.
+			_ = modelActions[i].Doc.SetField(c.revisionField, rev)
+		}
+	}
+	if res.DeletedCount != nDeletes {
+		// Some Delete actions failed. It's not an error if a Delete failed because
+		// the document didn't exist, but it is an error if it failed because of a
+		// precondition mismatch. Find all the documents with revisions we tried to delete; if
+		// any are still present, that's an error.
+		c.determineDeleteErrors(ctx, models, modelActions, errs)
+	}
+	if res.MatchedCount+res.UpsertedCount != nNonCreateWrite {
+		reterrs = append(reterrs, gcerr.Newf(gcerr.NotFound, nil, "some writes failed (replaced %d, upserted %d, out of total %d)", res.MatchedCount, res.UpsertedCount, nNonCreateWrite))
+	}
+	return reterrs
+}
+
+func (c *collection) determineDeleteErrors(ctx context.Context, models []mongo.WriteModel, actions []*driver.Action, errs []error) {
+	// TODO(jba): do this concurrently.
+	for i, m := range models {
+		if dm, ok := m.(*mongo.DeleteOneModel); ok {
+			filter := dm.Filter.(bson.D)
+			if len(filter) > 1 {
+				// Delete with both ID and revision. See if the document is still there.
+				idOnlyFilter := filter[:1]
+				// TODO(shantuo): use Find instead of FindOne.
+				res := c.coll.FindOne(ctx, idOnlyFilter)
+
+				// Assume an error means the document wasn't found.
+				// That means either that it was deleted successfully, or that it never
+				// existed. Either way, it's not an error.
+				// TODO(jba): distinguish between not found and other errors.
+				if res.Err() == nil {
+					// The document exists, but we didn't delete it: assume we had the wrong
+					// revision.
+					errs[actions[i].Index] = gcerr.Newf(gcerr.FailedPrecondition, nil,
+						"wrong revision for document with ID %v", actions[i].Key)
+				}
+			}
+		}
+	}
+}
+
+func (c *collection) newCreateModel(a *driver.Action) (*mongo.InsertOneModel, interface{}, string, error) {
+	mdoc, createdID, rev, err := c.prepareCreate(a)
+	if err != nil {
+		return nil, nil, "", err
+	}
+	return &mongo.InsertOneModel{Document: mdoc}, createdID, rev, nil
+}
+
+func (c *collection) newDeleteModel(a *driver.Action) (*mongo.DeleteOneModel, error) {
+	id, err := encodeValue(a.Key)
+	if err != nil {
+		return nil, err
+	}
+	filter, _, err := c.makeFilter(id, a.Doc)
+	if err != nil {
+		return nil, err
+	}
+	return &mongo.DeleteOneModel{Filter: filter}, nil
+}
+
+func (c *collection) newReplaceModel(a *driver.Action, upsert bool) (*mongo.ReplaceOneModel, string, error) {
+	filter, mdoc, rev, err := c.prepareReplace(a)
+	if err != nil {
+		return nil, "", err
+	}
+	return &mongo.ReplaceOneModel{
+		Filter:      filter,
+		Replacement: mdoc,
+		Upsert:      &upsert,
+	}, rev, nil
+}
+
+func (c *collection) newUpdateModel(a *driver.Action) (*mongo.UpdateOneModel, string, error) {
+	filter, updateDoc, rev, err := c.prepareUpdate(a)
+	if err != nil {
+		return nil, "", err
+	}
+	if filter == nil { // no-op
+		return nil, "", nil
+	}
+	return &mongo.UpdateOneModel{Filter: filter, Update: updateDoc}, rev, nil
 }
 
 // As implements driver.As.
@@ -464,24 +580,50 @@ func (c *collection) As(i interface{}) bool {
 	return true
 }
 
-// Error code for a write error when no documents match a filter.
-// (The Go mongo driver doesn't define an exported constant for this.)
-const mongoNotFoundCode = 11000
+// ErrorAs implements driver.Collection.ErrorAs
+func (c *collection) ErrorAs(err error, i interface{}) bool {
+	switch e := err.(type) {
+	case mongo.CommandError:
+		if p, ok := i.(*mongo.CommandError); ok {
+			*p = e
+			return true
+		}
+	case mongo.BulkWriteError:
+		if p, ok := i.(*mongo.BulkWriteError); ok {
+			*p = e
+			return true
+		}
+	case mongo.BulkWriteException:
+		if p, ok := i.(*mongo.BulkWriteException); ok {
+			*p = e
+			return true
+		}
+	}
+	return false
+}
 
 func (c *collection) ErrorCode(err error) gcerrors.ErrorCode {
 	if g, ok := err.(*gcerr.Error); ok {
 		return g.Code
 	}
+	if err == mongo.ErrNoDocuments {
+		return gcerrors.NotFound
+	}
 	if wexc, ok := err.(mongo.WriteException); ok && len(wexc.WriteErrors) > 0 {
-		if wexc.WriteErrors[0].Code == mongoNotFoundCode {
-			return gcerrors.NotFound
-		}
+		return translateMongoCode(wexc.WriteErrors[0].Code)
 	}
 	return gcerrors.Unknown
 }
 
-func sliceToLower(s []string) {
-	for i, e := range s {
-		s[i] = strings.ToLower(e)
+// Error code for a write error when no documents match a filter.
+// (The Go mongo driver doesn't define an exported constant for this.)
+const mongoDupKeyCode = 11000
+
+func translateMongoCode(code int) gcerrors.ErrorCode {
+	switch code {
+	case mongoDupKeyCode:
+		return gcerrors.AlreadyExists
+	default:
+		return gcerrors.Unknown
 	}
 }

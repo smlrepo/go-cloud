@@ -20,23 +20,31 @@ import (
 	"io"
 	"strings"
 
-	"github.com/aws/aws-sdk-go/service/dynamodb"
+	dyn "github.com/aws/aws-sdk-go/service/dynamodb"
 	"github.com/aws/aws-sdk-go/service/dynamodb/expression"
+	"gocloud.dev/gcerrors"
 	"gocloud.dev/internal/docstore"
 	"gocloud.dev/internal/docstore/driver"
+	"gocloud.dev/internal/gcerr"
 )
 
 // TODO: support parallel scans (http://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Scan.html#Scan.ParallelScan)
 
-// TODO: support an empty item slice returned from an RPC: "A Query operation can
+// TODO(jba): support an empty item slice returned from an RPC: "A Query operation can
 // return an empty result set and a LastEvaluatedKey if all the items read for the
 // page of results are filtered out."
 
-type avmap = map[string]*dynamodb.AttributeValue
+type avmap = map[string]*dyn.AttributeValue
 
 func (c *collection) RunGetQuery(ctx context.Context, q *driver.Query) (driver.DocumentIterator, error) {
 	qr, err := c.planQuery(q)
 	if err != nil {
+		if gcerrors.Code(err) == gcerrors.Unimplemented && c.opts.RunQueryFallback != nil {
+			return c.opts.RunQueryFallback(ctx, q, c.RunGetQuery)
+		}
+		return nil, err
+	}
+	if err := c.checkPlan(qr); err != nil {
 		return nil, err
 	}
 	it := &documentIterator{
@@ -51,22 +59,32 @@ func (c *collection) RunGetQuery(ctx context.Context, q *driver.Query) (driver.D
 	return it, nil
 }
 
+func (c *collection) checkPlan(qr *queryRunner) error {
+	if qr.scanIn != nil && qr.scanIn.FilterExpression != nil && !c.opts.AllowScans {
+		return gcerr.Newf(gcerr.InvalidArgument, nil, "query requires a table scan; set Options.AllowScans to true to enable")
+	}
+	return nil
+}
+
 func (c *collection) planQuery(q *driver.Query) (*queryRunner, error) {
 	var cb expression.Builder
 	cbUsed := false // It's an error to build an empty Builder.
 	// Set up the projection expression.
 	if len(q.FieldPaths) > 0 {
 		var pb expression.ProjectionBuilder
-		hasRevisionField := false
+		hasFields := map[string]bool{}
 		for _, fp := range q.FieldPaths {
-			if fpEqual(fp, docstore.RevisionField) {
-				hasRevisionField = true
+			if len(fp) == 1 {
+				hasFields[fp[0]] = true
 			}
 			pb = pb.AddNames(expression.Name(strings.Join(fp, ".")))
 		}
-		if !hasRevisionField {
-			pb = pb.AddNames(expression.Name(docstore.RevisionField))
-			q.FieldPaths = append(q.FieldPaths, []string{docstore.RevisionField})
+		// Always include the key and revision fields.
+		for _, f := range []string{c.partitionKey, c.sortKey, docstore.RevisionField} {
+			if f != "" && !hasFields[f] {
+				pb = pb.AddNames(expression.Name(f))
+				q.FieldPaths = append(q.FieldPaths, []string{f})
+			}
 		}
 		cb = cb.WithProjection(pb)
 		cbUsed = true
@@ -76,11 +94,20 @@ func (c *collection) planQuery(q *driver.Query) (*queryRunner, error) {
 	indexName, pkey, skey := c.bestQueryable(q)
 	if indexName == nil && pkey == "" {
 		// No query can be done: fall back to scanning.
+		if q.OrderByField != "" {
+			// Scans are unordered, so we can't run this query.
+			// TODO(jba): If the user specifies all the partition keys, and there is a global
+			// secondary index whose sort key is the order-by field, then we can query that index
+			// for every value of the partition key and merge the results.
+			// TODO(jba): If the query has a reasonable limit N, then we can run a scan and keep
+			// the top N documents in memory.
+			return nil, gcerr.Newf(gcerr.Unimplemented, nil, "query requires a table scan, but has an ordering requirement; add an index or provide Options.RunQueryFallback")
+		}
 		if len(q.Filters) > 0 {
 			cb = cb.WithFilter(filtersToConditionBuilder(q.Filters))
 			cbUsed = true
 		}
-		in := &dynamodb.ScanInput{TableName: &c.table}
+		in := &dyn.ScanInput{TableName: &c.table}
 		if cbUsed {
 			ce, err := cb.Build()
 			if err != nil {
@@ -100,17 +127,21 @@ func (c *collection) planQuery(q *driver.Query) (*queryRunner, error) {
 	if err != nil {
 		return nil, err
 	}
+	qIn := &dyn.QueryInput{
+		TableName:                 &c.table,
+		IndexName:                 indexName,
+		ExpressionAttributeNames:  ce.Names(),
+		ExpressionAttributeValues: ce.Values(),
+		KeyConditionExpression:    ce.KeyCondition(),
+		FilterExpression:          ce.Filter(),
+		ProjectionExpression:      ce.Projection(),
+	}
+	if q.OrderByField != "" && !q.OrderAscending {
+		qIn.ScanIndexForward = &q.OrderAscending
+	}
 	return &queryRunner{
-		c: c,
-		queryIn: &dynamodb.QueryInput{
-			TableName:                 &c.table,
-			IndexName:                 indexName,
-			ExpressionAttributeNames:  ce.Names(),
-			ExpressionAttributeValues: ce.Values(),
-			KeyConditionExpression:    ce.KeyCondition(),
-			FilterExpression:          ce.Filter(),
-			ProjectionExpression:      ce.Projection(),
-		},
+		c:         c,
+		queryIn:   qIn,
 		beforeRun: q.BeforeQuery,
 	}, nil
 }
@@ -123,15 +154,17 @@ func (c *collection) bestQueryable(q *driver.Query) (indexName *string, pkey, sk
 	// If the query has an "=" filter on the table's partition key, look at the table
 	// and local indexes.
 	if hasEqualityFilter(q, c.partitionKey) {
-		// If the table has a sort key that's in the query, use the table.
-		if hasFilter(q, c.sortKey) {
+		// If the table has a sort key that's in the query, and the ordering
+		// constraint works with the sort key, use the table.
+		// (Query results are always ordered by sort key.)
+		if hasFilter(q, c.sortKey) && orderingConsistent(q, c.sortKey) {
 			return nil, c.partitionKey, c.sortKey
 		}
 		// Look at local indexes. They all have the same partition key as the base table.
 		// If one has a sort key in the query, use it.
 		for _, li := range c.description.LocalSecondaryIndexes {
 			pkey, skey := keyAttributes(li.KeySchema)
-			if hasFilter(q, skey) && localFieldsIncluded(q, li) {
+			if hasFilter(q, skey) && localFieldsIncluded(q, li) && orderingConsistent(q, skey) {
 				return li.IndexName, pkey, skey
 			}
 		}
@@ -143,21 +176,21 @@ func (c *collection) bestQueryable(q *driver.Query) (indexName *string, pkey, sk
 		if skey == "" {
 			continue // We'll visit global indexes without a sort key later.
 		}
-		if hasEqualityFilter(q, pkey) && hasFilter(q, skey) && c.globalFieldsIncluded(q, gi) {
+		if hasEqualityFilter(q, pkey) && hasFilter(q, skey) && c.globalFieldsIncluded(q, gi) && orderingConsistent(q, skey) {
 			return gi.IndexName, pkey, skey
 		}
 	}
 	// There are no matches for both partition and sort key. Now consider matches on partition key only.
 	// That will still be better than a scan.
 	// First, check the table itself.
-	if hasEqualityFilter(q, c.partitionKey) {
+	if hasEqualityFilter(q, c.partitionKey) && orderingConsistent(q, c.sortKey) {
 		return nil, c.partitionKey, c.sortKey
 	}
 	// No point checking local indexes: they have the same partition key as the table.
 	// Check the global indexes.
 	for _, gi := range c.description.GlobalSecondaryIndexes {
 		pkey, skey := keyAttributes(gi.KeySchema)
-		if hasEqualityFilter(q, pkey) && c.globalFieldsIncluded(q, gi) {
+		if hasEqualityFilter(q, pkey) && c.globalFieldsIncluded(q, gi) && orderingConsistent(q, skey) {
 			return gi.IndexName, pkey, skey
 		}
 	}
@@ -173,8 +206,14 @@ func (c *collection) bestQueryable(q *driver.Query) (indexName *string, pkey, sk
 // they are not projected into the index, the only case where a local index cannot
 // be used is when the query wants all the fields, and the index projection is not ALL.
 // See https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/LSI.html#LSI.Projections.
-func localFieldsIncluded(q *driver.Query, li *dynamodb.LocalSecondaryIndexDescription) bool {
+func localFieldsIncluded(q *driver.Query, li *dyn.LocalSecondaryIndexDescription) bool {
 	return len(q.FieldPaths) > 0 || *li.Projection.ProjectionType == "ALL"
+}
+
+// orderingConsistent reports whether the ordering constraint is consistent with the sort key field.
+// That is, either there is no OrderBy clause, or the clause specifies the sort field.
+func orderingConsistent(q *driver.Query, sortField string) bool {
+	return q.OrderByField == "" || q.OrderByField == sortField
 }
 
 // globalFieldsIncluded reports whether the fields selected by the query are
@@ -182,7 +221,7 @@ func localFieldsIncluded(q *driver.Query, li *dynamodb.LocalSecondaryIndexDescri
 // check before using the index, because if a global index doesn't have all the
 // desired fields, then a separate RPC for each returned item would be necessary to
 // retrieve those fields, and we'd rather scan than do that.
-func (c *collection) globalFieldsIncluded(q *driver.Query, gi *dynamodb.GlobalSecondaryIndexDescription) bool {
+func (c *collection) globalFieldsIncluded(q *driver.Query, gi *dyn.GlobalSecondaryIndexDescription) bool {
 	proj := gi.Projection
 	if *proj.ProjectionType == "ALL" {
 		// The index has all the fields of the table: we're good.
@@ -216,7 +255,7 @@ func (c *collection) globalFieldsIncluded(q *driver.Query, gi *dynamodb.GlobalSe
 
 // Extract the names of the partition and sort key attributes from the schema of a
 // table or index.
-func keyAttributes(ks []*dynamodb.KeySchemaElement) (pkey, skey string) {
+func keyAttributes(ks []*dyn.KeySchemaElement) (pkey, skey string) {
 	for _, k := range ks {
 		switch *k.KeyType {
 		case "HASH":
@@ -236,7 +275,7 @@ func hasFilter(q *driver.Query, field string) bool {
 		return false
 	}
 	for _, f := range q.Filters {
-		if fpEqual(f.FieldPath, field) {
+		if driver.FieldPathEqualsField(f.FieldPath, field) {
 			return true
 		}
 	}
@@ -246,21 +285,17 @@ func hasFilter(q *driver.Query, field string) bool {
 // Reports whether q has a filter that checks if the top-level field is equal to something.
 func hasEqualityFilter(q *driver.Query, field string) bool {
 	for _, f := range q.Filters {
-		if f.Op == driver.EqualOp && fpEqual(f.FieldPath, field) {
+		if f.Op == driver.EqualOp && driver.FieldPathEqualsField(f.FieldPath, field) {
 			return true
 		}
 	}
 	return false
 }
 
-func fpEqual(fp []string, s string) bool {
-	return len(fp) == 1 && fp[0] == s
-}
-
 type queryRunner struct {
 	c         *collection
-	scanIn    *dynamodb.ScanInput
-	queryIn   *dynamodb.QueryInput
+	scanIn    *dyn.ScanInput
+	queryIn   *dyn.QueryInput
 	beforeRun func(asFunc func(i interface{}) bool) error
 }
 
@@ -269,7 +304,7 @@ func (qr *queryRunner) run(ctx context.Context, startAfter avmap) (items []avmap
 		qr.scanIn.ExclusiveStartKey = startAfter
 		if qr.beforeRun != nil {
 			asFunc := func(i interface{}) bool {
-				p, ok := i.(**dynamodb.ScanInput)
+				p, ok := i.(**dyn.ScanInput)
 				if !ok {
 					return false
 				}
@@ -286,7 +321,7 @@ func (qr *queryRunner) run(ctx context.Context, startAfter avmap) (items []avmap
 		}
 		return out.Items, out.LastEvaluatedKey,
 			func(i interface{}) bool {
-				p, ok := i.(**dynamodb.ScanOutput)
+				p, ok := i.(**dyn.ScanOutput)
 				if !ok {
 					return false
 				}
@@ -297,7 +332,7 @@ func (qr *queryRunner) run(ctx context.Context, startAfter avmap) (items []avmap
 	qr.queryIn.ExclusiveStartKey = startAfter
 	if qr.beforeRun != nil {
 		asFunc := func(i interface{}) bool {
-			p, ok := i.(**dynamodb.QueryInput)
+			p, ok := i.(**dyn.QueryInput)
 			if !ok {
 				return false
 			}
@@ -314,7 +349,7 @@ func (qr *queryRunner) run(ctx context.Context, startAfter avmap) (items []avmap
 	}
 	return out.Items, out.LastEvaluatedKey,
 		func(i interface{}) bool {
-			p, ok := i.(**dynamodb.QueryOutput)
+			p, ok := i.(**dyn.QueryOutput)
 			if !ok {
 				return false
 			}
@@ -400,11 +435,11 @@ func toFilter(f driver.Filter) expression.ConditionBuilder {
 
 type documentIterator struct {
 	qr     *queryRunner
-	items  []map[string]*dynamodb.AttributeValue
+	items  []map[string]*dyn.AttributeValue
 	curr   int
 	limit  int
 	count  int // number of items returned
-	last   map[string]*dynamodb.AttributeValue
+	last   map[string]*dyn.AttributeValue
 	asFunc func(i interface{}) bool
 }
 
@@ -421,7 +456,7 @@ func (it *documentIterator) Next(ctx context.Context, doc driver.Document) error
 		}
 		it.curr = 0
 	}
-	if err := decodeDoc(&dynamodb.AttributeValue{M: it.items[it.curr]}, doc); err != nil {
+	if err := decodeDoc(&dyn.AttributeValue{M: it.items[it.curr]}, doc); err != nil {
 		return err
 	}
 	it.curr++
@@ -454,4 +489,61 @@ func (qr *queryRunner) queryPlan() string {
 		return fmt.Sprintf("Index: %q", *qr.queryIn.IndexName)
 	}
 	return "Table"
+}
+
+func (c *collection) RunDeleteQuery(ctx context.Context, q *driver.Query) error {
+	return c.runActionQuery(ctx, q, nil)
+}
+
+func (c *collection) RunUpdateQuery(ctx context.Context, q *driver.Query, mods []driver.Mod) error {
+	return c.runActionQuery(ctx, q, mods)
+}
+
+func (c *collection) runActionQuery(ctx context.Context, q *driver.Query, mods []driver.Mod) error {
+	q.FieldPaths = [][]string{{c.partitionKey}}
+	if c.sortKey != "" {
+		q.FieldPaths = append(q.FieldPaths, []string{c.sortKey})
+	}
+	qr, err := c.planQuery(q)
+	if err != nil {
+		return err
+	}
+
+	var actions []*driver.Action
+	var startAfter map[string]*dyn.AttributeValue
+	for {
+		items, last, _, err := qr.run(ctx, startAfter)
+		if err != nil {
+			return err
+		}
+		for _, item := range items {
+			doc, err := driver.NewDocument(map[string]interface{}{})
+			if err != nil {
+				return err
+			}
+			if err := decodeDoc(&dyn.AttributeValue{M: item}, doc); err != nil {
+				return err
+			}
+			key, err := c.Key(doc)
+			if err != nil {
+				return err
+			}
+			a := &driver.Action{Doc: doc, Key: key, Index: len(actions), Mods: mods}
+			if mods == nil {
+				a.Kind = driver.Delete
+			} else {
+				a.Kind = driver.Update
+			}
+			actions = append(actions, a)
+		}
+		if last == nil {
+			break
+		}
+		startAfter = last
+	}
+	alerr := c.RunActions(ctx, actions, &driver.RunActionsOptions{})
+	if len(alerr) == 0 {
+		return nil
+	}
+	return docstore.ActionListError(alerr)
 }

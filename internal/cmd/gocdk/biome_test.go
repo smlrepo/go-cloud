@@ -15,54 +15,58 @@
 package main
 
 import (
+	"context"
+	"io/ioutil"
+	"path/filepath"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
-	"golang.org/x/xerrors"
 )
 
-func TestReadBiomeConfig(t *testing.T) {
+func TestBiomeAdd(t *testing.T) {
 	t.Run("Success", func(t *testing.T) {
-		dir, cleanup, err := newTestModule()
+		ctx := context.Background()
+		pctx, cleanup, err := newTestProject(ctx)
 		if err != nil {
 			t.Fatal(err)
 		}
 		defer cleanup()
-		const biome = "foo"
-		want := &biomeConfig{
-			ServeEnabled: configBool(true),
-			Launcher:     configString("rocket"),
-		}
-		if err := newTestBiome(dir, biome, "ohai", want); err != nil {
+		const newBiome = "foo"
+		if err := biomeAdd(ctx, pctx, newBiome); err != nil {
 			t.Fatal(err)
 		}
 
-		got, err := readBiomeConfig(dir, biome)
+		// Ensure at least one file exists in the new biome with extension .tf.
+		newBiomePath := filepath.Join(pctx.workdir, "biomes", newBiome)
+		newBiomeContents, err := ioutil.ReadDir(newBiomePath)
 		if err != nil {
-			t.Fatalf("readBiomeConfig(%q, %q): %+v", dir, biome, err)
+			t.Error(err)
+		} else {
+			foundTF := false
+			var foundNames []string
+			for _, info := range newBiomeContents {
+				foundNames = append(foundNames, info.Name())
+				if filepath.Ext(info.Name()) == ".tf" {
+					foundTF = true
+				}
+			}
+			if !foundTF {
+				t.Errorf("%s contains %v; want to contain at least one \".tf\" file", newBiomePath, foundNames)
+			}
+		}
+
+		// Ensure that there is a biome.json file in the correct directory and
+		// that it contains the correct settings for a non-dev biome.
+		want := &biomeConfig{
+			ServeEnabled: configBool(false),
+			Launcher:     configString("cloudrun"),
+		}
+		got, err := readBiomeConfig(pctx.workdir, newBiome)
+		if err != nil {
+			t.Fatalf("biomeAdd: %+v", err)
 		}
 		if diff := cmp.Diff(want, got); diff != "" {
-			t.Errorf("readBiomeConfig(%q, %q) diff (-want +got):\n%s", dir, biome, diff)
+			t.Errorf("biomeAdd diff (-want +got):\n%s", diff)
 		}
 	})
-	t.Run("DirNotExist", func(t *testing.T) {
-		dir, cleanup, err := newTestModule()
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer cleanup()
-
-		_, err = readBiomeConfig(dir, "dev")
-		if !xerrors.As(err, new(*biomeNotFoundError)) {
-			t.Errorf("readBiomeConfig(%q, \"dev\") error =\n%+v\n; want biome not found error", dir, err)
-		}
-	})
-}
-
-func configBool(b bool) *bool {
-	return &b
-}
-
-func configString(s string) *string {
-	return &s
 }

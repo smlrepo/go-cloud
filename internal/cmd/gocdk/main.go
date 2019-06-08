@@ -17,73 +17,67 @@ package main
 import (
 	"bytes"
 	"context"
-	"flag"
 	"fmt"
 	"io"
+	"io/ioutil"
+	"log"
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
+	"strings"
 
+	"github.com/spf13/cobra"
+	"gocloud.dev/gcp"
+	"golang.org/x/oauth2/google"
 	"golang.org/x/xerrors"
 )
 
+// generate_static converts the files in static/_assets into constants in
+// the static package (in static/vfsdata.go).
+//go:generate go run generate_static.go
+
 func main() {
-	pctx, err := osProcessContext()
+	pctx, err := newOSProcessContext()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 
 	}
-	debug := false
 	ctx, done := withInterrupt(context.Background())
-	err = run(ctx, pctx, os.Args[1:], &debug)
+	err = run(ctx, pctx, os.Args[1:])
 	done()
 	if err != nil {
-		if debug {
-			fmt.Fprintf(os.Stderr, "%+v\n", err)
-		} else {
-			// TODO(light): format error message parts one per line?
-			fmt.Fprintf(os.Stderr, "%v\n", err)
-		}
-		if xerrors.As(err, new(usageError)) {
-			os.Exit(64)
-		}
 		os.Exit(1)
 	}
 }
 
-func run(ctx context.Context, pctx *processContext, args []string, debug *bool) error {
-	globalFlags := newFlagSet(pctx, "gocdk")
-	globalFlags.BoolVar(debug, "debug", false, "show verbose error messages")
-	if err := globalFlags.Parse(args); xerrors.Is(err, flag.ErrHelp) {
-		return nil
-	} else if err != nil {
-		return usagef("gocdk: %w", err)
-	}
-	if globalFlags.NArg() == 0 {
-		return usagef("gocdk COMMAND ...")
+func run(ctx context.Context, pctx *processContext, args []string) error {
+	var rootCmd = &cobra.Command{
+		Use:   "gocdk",
+		Short: "TODO gocdk",
+		Long:  "TODO more about gocdk",
+		// We want to print usage for any command/flag parsing errors, but
+		// suppress usage for random errors returned by a command's RunE.
+		// This function gets called right before RunE, so suppress from now on.
+		PersistentPreRun: func(cmd *cobra.Command, args []string) {
+			cmd.SilenceUsage = true
+		},
 	}
 
-	cmdArgs := globalFlags.Args()[1:]
-	switch cmdName := globalFlags.Arg(0); cmdName {
-	case "init":
-		return init_(ctx, pctx, cmdArgs)
-	case "serve":
-		return serve(ctx, pctx, cmdArgs)
-	case "add":
-		return add(ctx, pctx, cmdArgs)
-	case "deploy":
-		return deploy(ctx, pctx, cmdArgs)
-	case "build":
-		return build(ctx, pctx, cmdArgs)
-	case "apply":
-		return apply(ctx, pctx, cmdArgs)
-	case "launch":
-		return launch(ctx, pctx, cmdArgs)
-	default:
-		// TODO(light): We should do spell-checking/fuzzy-matching.
-		return usagef("unknown gocdk command %s", cmdName)
-	}
+	registerInitCmd(ctx, pctx, rootCmd)
+	registerServeCmd(ctx, pctx, rootCmd)
+	registerDemoCmd(ctx, pctx, rootCmd)
+	registerBiomeCmd(ctx, pctx, rootCmd)
+	registerProvisionCmd(ctx, pctx, rootCmd)
+	registerDeployCmd(ctx, pctx, rootCmd)
+	registerBuildCmd(ctx, pctx, rootCmd)
+	registerApplyCmd(ctx, pctx, rootCmd)
+	registerLaunchCmd(ctx, pctx, rootCmd)
+
+	rootCmd.SetArgs(args)
+	rootCmd.SetOutput(pctx.stderr)
+	return rootCmd.Execute()
 }
 
 // processContext is the state that gocdk uses to run. It is collected in
@@ -94,45 +88,117 @@ type processContext struct {
 	stdin   io.Reader
 	stdout  io.Writer
 	stderr  io.Writer
+	outlog  *log.Logger
+	errlog  *log.Logger
 }
 
-// osProcessContext returns the default process context from global variables.
-func osProcessContext() (*processContext, error) {
+// newOSProcessContext returns the default processContext from global variables.
+func newOSProcessContext() (*processContext, error) {
 	workdir, err := os.Getwd()
 	if err != nil {
 		return nil, err
 	}
+	return newProcessContext(workdir, os.Stdin, os.Stdout, os.Stderr), nil
+}
+
+// newTestProcessContext returns a processContext for use in tests.
+func newTestProcessContext(workdir string) *processContext {
+	return newProcessContext(workdir, strings.NewReader(""), ioutil.Discard, ioutil.Discard)
+}
+
+// newProcessContext returns a processContext.
+func newProcessContext(workdir string, stdin io.Reader, stdout, stderr io.Writer) *processContext {
 	return &processContext{
 		workdir: workdir,
 		env:     os.Environ(),
-		stdin:   os.Stdin,
-		stdout:  os.Stdout,
-		stderr:  os.Stderr,
-	}, nil
+		stdin:   stdin,
+		stdout:  stdout,
+		stderr:  stderr,
+		outlog:  log.New(stdout, "", 0),
+		errlog:  log.New(stderr, "gocdk: ", 0),
+	}
 }
 
-// overrideEnv returns a copy of pctx.env that has vars appended to the end.
-// This method is safe to call from multiple goroutines.
-func (pctx *processContext) overrideEnv(vars ...string) []string {
+// overrideEnv returns a copy of env that has vars appended to the end.
+// It will not modify env's backing array.
+func overrideEnv(env []string, vars ...string) []string {
 	// Setting the slice's capacity to length ensures that a new backing array
 	// is allocated if len(vars) > 0.
-	return append(pctx.env[:len(pctx.env):len(pctx.env)], vars...)
+	return append(env[:len(env):len(env)], vars...)
 }
 
-// findModuleRoot searches the given directory and those above it for the Go
-// module root.
-func findModuleRoot(ctx context.Context, dir string) (string, error) {
+// resolve joins path with pctx.workdir if path is relative. Otherwise,
+// it returns path.
+func (pctx *processContext) resolve(path string) string {
+	if filepath.IsAbs(path) {
+		return path
+	}
+	return filepath.Join(pctx.workdir, path)
+}
+
+// gcpCredentials returns the credentials to use for this process context.
+func (pctx *processContext) gcpCredentials(ctx context.Context) (*google.Credentials, error) {
+	// TODO(light): google.DefaultCredentials uses Getenv directly, so it is
+	// difficult to disentangle to use processContext.
+	return gcp.DefaultCredentials(ctx)
+}
+
+// Logf writes to the pctx's stderr.
+func (pctx *processContext) Logf(format string, a ...interface{}) {
+	pctx.errlog.Printf(format, a...)
+}
+
+// Printf writes to the pctx's stdout.
+func (pctx *processContext) Printf(format string, a ...interface{}) {
+	pctx.outlog.Printf(format, a...)
+}
+
+// Println writes to the pctx's stdout.
+func (pctx *processContext) Println(a ...interface{}) {
+	pctx.outlog.Println(a...)
+}
+
+// ModuleRoot searches the given directory and those above it for the Go
+// module root. It also ensures that the module looks like a Go CDK project,
+// based on the existence of a "biomes" directory.
+func (pctx *processContext) ModuleRoot(ctx context.Context) (string, error) {
 	c := exec.CommandContext(ctx, "go", "list", "-m", "-f", "{{.Dir}}")
-	c.Dir = dir
+	c.Dir = pctx.workdir
 	output, err := c.Output()
 	if err != nil {
-		return "", xerrors.Errorf("find module root for %s: %w", dir, err)
+		return "", xerrors.Errorf("couldn't find a Go module root at or above %s", pctx.workdir)
 	}
 	output = bytes.TrimSuffix(output, []byte("\n"))
 	if len(output) == 0 {
-		return "", xerrors.Errorf("find module root for %s: no module found", dir, err)
+		return "", xerrors.Errorf("couldn't find a Go module root at or above %s", pctx.workdir)
 	}
-	return string(output), nil
+	root := string(output)
+	if _, err := os.Stat(biomesRootDir(root)); err != nil {
+		return "", xerrors.Errorf("Go module root %s doesn't look like a Go CDK project (no biomes/ directory)", root)
+	}
+	return root, nil
+}
+
+// NewCommand creates a new exec.Cmd based on this processContext.
+//
+// dir may be empty; it defaults to pctx.workdir.
+//
+// Note that this function sets cmd.Stdout, and that Cmd.Output requires
+// Stdout to be nil; you may need to set it back to nil explicitly (or
+// don't use this function). Similarly for Cmd.CombinedOutput, for both
+// Stdout and Stderr.
+func (pctx *processContext) NewCommand(ctx context.Context, dir, name string, arg ...string) *exec.Cmd {
+	cmd := exec.CommandContext(ctx, name, arg...)
+	if dir == "" {
+		cmd.Dir = pctx.workdir
+	} else {
+		cmd.Dir = dir
+	}
+	cmd.Env = pctx.env
+	cmd.Stdin = pctx.stdin
+	cmd.Stdout = pctx.stdout
+	cmd.Stderr = pctx.stderr
+	return cmd
 }
 
 // withInterrupt returns a copy of parent with a new Done channel. The returned

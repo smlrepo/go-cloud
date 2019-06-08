@@ -26,7 +26,7 @@ import (
 	"gocloud.dev/pubsub/driver"
 	"gocloud.dev/pubsub/drivertest"
 
-	common "github.com/Azure/azure-amqp-common-go"
+	common "github.com/Azure/azure-amqp-common-go/v2"
 	servicebus "github.com/Azure/azure-service-bus-go"
 )
 
@@ -122,7 +122,7 @@ func (h *harness) CreateSubscription(ctx context.Context, dt driver.Topic, testN
 
 	sopts := SubscriptionOptions{}
 	if h.autodelete {
-		sopts.AckFuncForReceiveAndDelete = func() {}
+		sopts.ReceiveAndDelete = true
 	}
 	ds, err = openSubscription(ctx, h.ns, t.sbTopic, sbSub, &sopts)
 	if err != nil {
@@ -147,6 +147,8 @@ func (h *harness) Close() {
 }
 
 func (h *harness) MaxBatchSizes() (int, int) { return sendBatcherOpts.MaxBatchSize, 0 }
+
+func (h *harness) SupportsMultipleSubscriptions() bool { return true }
 
 // Please run the TestConformance with an extended timeout since each test needs to perform CRUD for ServiceBus Topics and Subscriptions.
 // Example: C:\Go\bin\go.exe test -timeout 60s gocloud.dev/pubsub/azuresb -run ^TestConformance$

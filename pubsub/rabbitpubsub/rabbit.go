@@ -576,7 +576,7 @@ func (s *subscription) ReceiveBatch(ctx context.Context, maxMessages int) ([]*dr
 
 	// Get up to maxMessages waiting messages, but don't take too long.
 	var ms []*driver.Message
-	maxTime := time.Tick(50 * time.Millisecond)
+	maxTime := time.NewTimer(50 * time.Millisecond)
 	for {
 		select {
 		case <-ctx.Done():
@@ -609,9 +609,10 @@ func (s *subscription) ReceiveBatch(ctx context.Context, maxMessages int) ([]*dr
 				return ms, nil
 			}
 
-		case <-maxTime:
+		case <-maxTime.C:
 			// Timed out. Return whatever we have. If we have nothing, we'll get
-			// called again soon, but returning allows us to give up the lock.
+			// called again soon, but returning allows us to give up the lock in
+			// case there are acks/nacks to be sent.
 			return ms, nil
 		}
 	}
@@ -711,9 +712,6 @@ func (s *subscription) As(i interface{}) bool {
 func (*subscription) ErrorAs(err error, i interface{}) bool {
 	return errorAs(err, i)
 }
-
-// AckFunc implements driver.Subscription.AckFunc.
-func (*subscription) AckFunc() func() { return nil }
 
 // Close implements driver.Subscription.Close.
 func (*subscription) Close() error { return nil }

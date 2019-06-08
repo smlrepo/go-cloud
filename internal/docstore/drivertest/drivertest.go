@@ -25,6 +25,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gogo/protobuf/proto"
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
 	"gocloud.dev/gcerrors"
@@ -32,16 +33,6 @@ import (
 	ds "gocloud.dev/internal/docstore"
 	"gocloud.dev/internal/docstore/driver"
 )
-
-// TODO(jba): Test RunActions with unordered=true. We can't actually test the ordering,
-// but we can check that all actions are executed even if some fail.
-
-// TODO(jba): test an ordered list of actions, with an expected error in the middle,
-// and check that we get the right error back and that the actions after the error
-// aren't executed.
-
-// TODO(jba): test that a malformed action is returned as an error and none of the
-// actions are executed.
 
 // Harness descibes the functionality test harnesses must provide to run
 // conformance tests.
@@ -78,8 +69,6 @@ type UnsupportedType int
 const (
 	// Native codec doesn't support any unsigned integer type
 	Uint UnsupportedType = iota
-	// Native codec doesn't support any complex type
-	Complex
 	// Native codec doesn't support arrays
 	Arrays
 	// Native codec doesn't support full time precision
@@ -104,12 +93,17 @@ type AsTest interface {
 	Name() string
 	// CollectionCheck will be called to allow verification of Collection.As.
 	CollectionCheck(coll *docstore.Collection) error
+	// BeforeDo will be passed directly to ActionList.BeforeDo as part of running
+	// the test actions.
+	BeforeDo(as func(interface{}) bool) error
 	// BeforeQuery will be passed directly to Query.BeforeQuery as part of doing
 	// the test query.
 	BeforeQuery(as func(interface{}) bool) error
 	// QueryCheck will be called after calling Query. It should call it.As and
 	// verify the results.
 	QueryCheck(it *docstore.DocumentIterator) error
+	// ErrorCheck is called to allow verification of Collection.ErrorAs.
+	ErrorCheck(c *docstore.Collection, err error) error
 }
 
 type verifyAsFailsOnNil struct{}
@@ -121,6 +115,13 @@ func (verifyAsFailsOnNil) Name() string {
 func (verifyAsFailsOnNil) CollectionCheck(coll *docstore.Collection) error {
 	if coll.As(nil) {
 		return errors.New("want Collection.As to return false when passed nil")
+	}
+	return nil
+}
+
+func (verifyAsFailsOnNil) BeforeDo(as func(interface{}) bool) error {
+	if as(nil) {
+		return errors.New("want ActionList.As to return false when passed nil")
 	}
 	return nil
 }
@@ -139,9 +140,21 @@ func (verifyAsFailsOnNil) QueryCheck(it *docstore.DocumentIterator) error {
 	return nil
 }
 
+func (v verifyAsFailsOnNil) ErrorCheck(c *docstore.Collection, err error) (ret error) {
+	defer func() {
+		if recover() == nil {
+			ret = errors.New("want ErrorAs to panic when passed nil")
+		}
+	}()
+	c.ErrorAs(err, nil)
+	return nil
+}
+
 // RunConformanceTests runs conformance tests for provider implementations of docstore.
 func RunConformanceTests(t *testing.T, newHarness HarnessMaker, ct CodecTester, asTests []AsTest) {
-	// TODO(jba): add conformance tests for unordered lists after all drivers have them.
+	t.Run("TypeDrivenCodec", func(t *testing.T) { testTypeDrivenDecode(t, ct) })
+	t.Run("BlindCodec", func(t *testing.T) { testBlindDecode(t, ct) })
+
 	t.Run("Create", func(t *testing.T) { withCollection(t, newHarness, testCreate) })
 	t.Run("Put", func(t *testing.T) { withCollection(t, newHarness, testPut) })
 	t.Run("Replace", func(t *testing.T) { withCollection(t, newHarness, testReplace) })
@@ -149,11 +162,13 @@ func RunConformanceTests(t *testing.T, newHarness HarnessMaker, ct CodecTester, 
 	t.Run("Delete", func(t *testing.T) { withCollection(t, newHarness, testDelete) })
 	t.Run("Update", func(t *testing.T) { withCollection(t, newHarness, testUpdate) })
 	t.Run("Data", func(t *testing.T) { withCollection(t, newHarness, testData) })
-	t.Run("TypeDrivenCodec", func(t *testing.T) { testTypeDrivenDecode(t, ct) })
-	t.Run("BlindCodec", func(t *testing.T) { testBlindDecode(t, ct) })
 	t.Run("MultipleActions", func(t *testing.T) { withCollection(t, newHarness, testMultipleActions) })
+	t.Run("UnorderedActions", func(t *testing.T) { withCollection(t, newHarness, testUnorderedActions) })
+	t.Run("GetQueryKeyField", func(t *testing.T) { withCollection(t, newHarness, testGetQueryKeyField) })
 
-	t.Run("Query", func(t *testing.T) { withTwoKeyCollection(t, newHarness, testQuery) })
+	t.Run("GetQuery", func(t *testing.T) { withTwoKeyCollection(t, newHarness, testGetQuery) })
+	t.Run("DeleteQuery", func(t *testing.T) { withTwoKeyCollection(t, newHarness, testDeleteQuery) })
+	t.Run("UpdateQuery", func(t *testing.T) { withTwoKeyCollection(t, newHarness, testUpdateQuery) })
 
 	asTests = append(asTests, verifyAsFailsOnNil{})
 	t.Run("As", func(t *testing.T) {
@@ -183,6 +198,7 @@ func withCollection(t *testing.T, newHarness HarnessMaker, f func(*testing.T, *d
 		t.Fatal(err)
 	}
 	coll := ds.NewCollection(dc)
+	cleanUpTable(t, coll)
 	f(t, coll)
 }
 
@@ -199,6 +215,7 @@ func withTwoKeyCollection(t *testing.T, newHarness HarnessMaker, f func(*testing
 		t.Fatal(err)
 	}
 	coll := ds.NewCollection(dc)
+	cleanUpTable(t, coll)
 	f(t, coll)
 }
 
@@ -207,45 +224,42 @@ const KeyField = "name"
 
 type docmap = map[string]interface{}
 
-var nonexistentDoc = docmap{KeyField: "doesNotExist"}
+func nonexistentDoc() docmap { return docmap{KeyField: "doesNotExist"} }
 
+// TODO(jba): test structs
 func testCreate(t *testing.T, coll *ds.Collection) {
 	ctx := context.Background()
 	named := docmap{KeyField: "testCreate1", "b": true}
-	// TODO(#1857): dynamodb requires the sort key field when it is defined. We
-	// don't generate random sort key so we need to skip the unnamed test and
-	// figure out what to do in this situation.
-	// unnamed := docmap{"b": false}
-	// Attempt to clean up
-	defer func() {
-		_ = coll.Actions().Delete(named).
-			// Delete(unnamed).
-			Do(ctx)
-	}()
-
+	unnamed := docmap{"b": false}
 	createThenGet := func(doc docmap) {
 		t.Helper()
+		checkNoRevisionField(t, doc)
 		if err := coll.Create(ctx, doc); err != nil {
 			t.Fatalf("Create: %v", err)
 		}
+		checkHasRevisionField(t, doc)
 		got := docmap{KeyField: doc[KeyField]}
 		if err := coll.Get(ctx, got); err != nil {
 			t.Fatalf("Get: %v", err)
 		}
-		// got has a revision field that doc doesn't have.
-		doc[ds.RevisionField] = got[ds.RevisionField]
-		if diff := cmp.Diff(got, doc); diff != "" {
+		if diff := cmpDiff(got, doc); diff != "" {
 			t.Fatal(diff)
 		}
 	}
 
 	createThenGet(named)
-	// createThenGet(unnamed)
+	createThenGet(unnamed)
+	if unnamed[KeyField] == nil {
+		t.Error("unnamed[KeyField]: got nil, want a generated key")
+	}
 
 	// Can't create an existing doc.
-	if err := coll.Create(ctx, named); err == nil {
-		t.Error("got nil, want error")
-	}
+	err := coll.Create(ctx, docmap{KeyField: named[KeyField]})
+	checkCode(t, err, gcerrors.AlreadyExists)
+
+	// Can't create a doc with a revision field.
+	err = coll.Create(ctx, docmap{KeyField: "testCreate2", docstore.RevisionField: 0})
+	checkCode(t, err, gcerrors.InvalidArgument)
 }
 
 func testPut(t *testing.T, coll *ds.Collection) {
@@ -259,23 +273,33 @@ func testPut(t *testing.T, coll *ds.Collection) {
 
 	named := docmap{KeyField: "testPut1", "b": true}
 	// Create a new doc.
+	checkNoRevisionField(t, named)
 	must(coll.Put(ctx, named))
+	checkHasRevisionField(t, named)
 	got := docmap{KeyField: named[KeyField]}
 	must(coll.Get(ctx, got))
-	named[ds.RevisionField] = got[ds.RevisionField] // copy returned revision field
-	if diff := cmp.Diff(got, named); diff != "" {
+	if diff := cmpDiff(got, named); diff != "" {
 		t.Fatalf(diff)
 	}
 
 	// Replace an existing doc.
 	named["b"] = false
+	named[ds.RevisionField] = nil
+	checkNoRevisionField(t, named)
 	must(coll.Put(ctx, named))
+	checkHasRevisionField(t, named)
+	rev := named[ds.RevisionField]
 	must(coll.Get(ctx, got))
-	named[ds.RevisionField] = got[ds.RevisionField]
-	if diff := cmp.Diff(got, named); diff != "" {
+	if diff := cmpDiff(got, named); diff != "" {
 		t.Fatalf(diff)
 	}
 
+	// Putting a doc with a revision field is the same as Replace, meaning
+	// it will fail if the document doesn't exist.
+	err := coll.Put(ctx, docmap{KeyField: "testPut2", ds.RevisionField: rev})
+	if c := gcerrors.Code(err); c != gcerrors.NotFound && c != gcerrors.FailedPrecondition {
+		t.Errorf("got %v, want NotFound or FailedPrecondition", err)
+	}
 	t.Run("revision", func(t *testing.T) {
 		testRevisionField(t, coll, func(dm docmap) error {
 			return coll.Put(ctx, dm)
@@ -295,17 +319,17 @@ func testReplace(t *testing.T, coll *ds.Collection) {
 	doc1 := docmap{KeyField: "testReplace", "s": "a"}
 	must(coll.Put(ctx, doc1))
 	doc1["s"] = "b"
+	doc1[ds.RevisionField] = nil
+	checkNoRevisionField(t, doc1)
 	must(coll.Replace(ctx, doc1))
+	checkHasRevisionField(t, doc1)
 	got := docmap{KeyField: doc1[KeyField]}
 	must(coll.Get(ctx, got))
-	doc1[ds.RevisionField] = got[ds.RevisionField] // copy returned revision field
-	if diff := cmp.Diff(got, doc1); diff != "" {
+	if diff := cmpDiff(got, doc1); diff != "" {
 		t.Fatalf(diff)
 	}
 	// Can't replace a nonexistent doc.
-	if err := coll.Replace(ctx, nonexistentDoc); err == nil {
-		t.Fatal("got nil, want error")
-	}
+	checkCode(t, coll.Replace(ctx, nonexistentDoc()), gcerrors.NotFound)
 
 	t.Run("revision", func(t *testing.T) {
 		testRevisionField(t, coll, func(dm docmap) error {
@@ -313,6 +337,30 @@ func testReplace(t *testing.T, coll *ds.Collection) {
 		})
 	})
 
+}
+
+// Check that doc does not have a revision field (or has a nil one).
+func checkNoRevisionField(t *testing.T, doc interface{}) {
+	t.Helper()
+	ddoc, err := driver.NewDocument(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rev, _ := ddoc.GetField(ds.RevisionField); rev != nil {
+		t.Fatal("doc has revision field")
+	}
+}
+
+// Check that doc has a non-nil revision field.
+func checkHasRevisionField(t *testing.T, doc interface{}) {
+	t.Helper()
+	ddoc, err := driver.NewDocument(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rev, err := ddoc.GetField(ds.RevisionField); err != nil || rev == nil {
+		t.Fatalf("doc missing revision field (error = %v)", err)
+	}
 }
 
 func testGet(t *testing.T, coll *ds.Collection) {
@@ -336,7 +384,7 @@ func testGet(t *testing.T, coll *ds.Collection) {
 	got := docmap{KeyField: doc[KeyField]}
 	must(coll.Get(ctx, got))
 	doc[ds.RevisionField] = got[ds.RevisionField] // copy returned revision field
-	if diff := cmp.Diff(got, doc); diff != "" {
+	if diff := cmpDiff(got, doc); diff != "" {
 		t.Error(diff)
 	}
 
@@ -352,12 +400,18 @@ func testGet(t *testing.T, coll *ds.Collection) {
 	if diff := cmp.Diff(got, want); diff != "" {
 		t.Error("Get with field paths:\n", diff)
 	}
+
+	err := coll.Get(ctx, nonexistentDoc())
+	checkCode(t, err, gcerrors.NotFound)
 }
 
 func testDelete(t *testing.T, coll *ds.Collection) {
 	ctx := context.Background()
 	doc := docmap{KeyField: "testDelete"}
-	if errs := coll.Actions().Put(doc).Delete(doc).Do(ctx); errs != nil {
+	if err := coll.Put(ctx, doc); err != nil {
+		t.Fatal(err)
+	}
+	if errs := coll.Actions().Delete(doc).Do(ctx); errs != nil {
 		t.Fatal(errs)
 	}
 	// The document should no longer exist.
@@ -365,12 +419,13 @@ func testDelete(t *testing.T, coll *ds.Collection) {
 		t.Error("want error, got nil")
 	}
 	// Delete doesn't fail if the doc doesn't exist.
-	if err := coll.Delete(ctx, nonexistentDoc); err != nil {
+	if err := coll.Delete(ctx, nonexistentDoc()); err != nil {
 		t.Errorf("delete nonexistent doc: want nil, got %v", err)
 	}
 
 	// Delete will fail if the revision field is mismatched.
 	got := docmap{KeyField: doc[KeyField]}
+	doc[ds.RevisionField] = nil
 	if errs := coll.Actions().Put(doc).Get(got).Do(ctx); errs != nil {
 		t.Fatal(errs)
 	}
@@ -378,43 +433,52 @@ func testDelete(t *testing.T, coll *ds.Collection) {
 	if err := coll.Put(ctx, doc); err != nil {
 		t.Fatal(err)
 	}
-	if err := coll.Delete(ctx, got); gcerrors.Code(err) != gcerrors.FailedPrecondition {
-		t.Errorf("got %v, want FailedPrecondition", err)
-	}
+	checkCode(t, coll.Delete(ctx, got), gcerrors.FailedPrecondition)
 }
 
 func testUpdate(t *testing.T, coll *ds.Collection) {
+	// TODO(jba): test an increment-only update.
 	ctx := context.Background()
-	doc := docmap{KeyField: "testUpdate", "a": "A", "b": "B"}
+	doc := docmap{KeyField: "testUpdate", "a": "A", "b": "B", "n": 3.5, "i": 1}
 	if err := coll.Put(ctx, doc); err != nil {
 		t.Fatal(err)
 	}
-
+	doc[ds.RevisionField] = nil
 	got := docmap{KeyField: doc[KeyField]}
+	checkNoRevisionField(t, doc)
 	errs := coll.Actions().Update(doc, ds.Mods{
 		"a": "X",
 		"b": nil,
 		"c": "C",
+		"n": docstore.Increment(-1),
+		"i": docstore.Increment(2.5), // incrementing an integer with a float works
+		"m": docstore.Increment(3),   // increment of a nonexistent field is like set
 	}).Get(got).Do(ctx)
 	if errs != nil {
 		t.Fatal(errs)
 	}
+	checkHasRevisionField(t, doc)
 	want := docmap{
 		KeyField:         doc[KeyField],
 		ds.RevisionField: got[ds.RevisionField],
 		"a":              "X",
 		"c":              "C",
+		"n":              2.5,
+		"i":              3.5,
+		"m":              int64(3),
 	}
 	if !cmp.Equal(got, want) {
 		t.Errorf("got %v, want %v", got, want)
 	}
 
-	// TODO(jba): test that empty mods is a no-op.
-
 	// Can't update a nonexistent doc.
-	if err := coll.Update(ctx, nonexistentDoc, ds.Mods{"x": "y"}); err == nil {
+	if err := coll.Update(ctx, nonexistentDoc(), ds.Mods{"x": "y"}); err == nil {
 		t.Error("nonexistent document: got nil, want error")
 	}
+
+	// Bad increment value.
+	err := coll.Update(ctx, doc, ds.Mods{"x": ds.Increment("3")})
+	checkCode(t, err, gcerrors.InvalidArgument)
 
 	t.Run("revision", func(t *testing.T) {
 		testRevisionField(t, coll, func(dm docmap) error {
@@ -423,6 +487,9 @@ func testUpdate(t *testing.T, coll *ds.Collection) {
 	})
 }
 
+// Test that:
+// - Writing a document with a revision field succeeds if the document hasn't changed.
+// - Writing a document with a revision field fails if the document has changed.
 func testRevisionField(t *testing.T, coll *ds.Collection, write func(docmap) error) {
 	ctx := context.Background()
 	must := func(err error) {
@@ -431,17 +498,17 @@ func testRevisionField(t *testing.T, coll *ds.Collection, write func(docmap) err
 			t.Fatal(err)
 		}
 	}
-	doc1 := docmap{KeyField: "testRevisionField", "s": "a"}
+	key := "testRevisionField"
+	doc1 := docmap{KeyField: key, "s": "a"}
 	must(coll.Put(ctx, doc1))
-	got := docmap{KeyField: doc1[KeyField]}
+	got := docmap{KeyField: key}
 	must(coll.Get(ctx, got))
 	rev, ok := got[ds.RevisionField]
 	if !ok || rev == nil {
 		t.Fatal("missing revision field")
 	}
-	got["s"] = "b"
 	// A write should succeed, because the document hasn't changed since it was gotten.
-	if err := write(got); err != nil {
+	if err := write(docmap{KeyField: key, "s": "b", ds.RevisionField: rev}); err != nil {
 		t.Fatalf("write with revision field got %v, want nil", err)
 	}
 	// This write should fail: got's revision field hasn't changed, but the stored document has.
@@ -525,7 +592,6 @@ func testTypeDrivenDecode(t *testing.T, ct CodecTester) {
 		I:  1,
 		U:  2,
 		F:  2.5,
-		C:  complex(3.0, 4.0),
 		St: "foo",
 		B:  true,
 		L:  []int{3, 4, 5},
@@ -571,16 +637,6 @@ func testTypeDrivenDecode(t *testing.T, ct CodecTester) {
 		u := &Uint{10}
 		check(u, &Uint{}, ct.DocstoreEncode, ct.NativeDecode)
 		check(u, &Uint{}, ct.NativeEncode, ct.DocstoreDecode)
-	}
-
-	// Complex numbers.
-	if !unsupported[Complex] {
-		type Complex struct {
-			C complex128
-		}
-		c := &Complex{complex(11, 12)}
-		check(c, &Complex{}, ct.DocstoreEncode, ct.NativeDecode)
-		check(c, &Complex{}, ct.NativeEncode, ct.DocstoreDecode)
 	}
 
 	// Arrays.
@@ -714,7 +770,6 @@ type docstoreRoundTrip struct {
 	I  int
 	U  uint
 	F  float64
-	C  complex128
 	St string
 	B  bool
 	By []byte
@@ -792,29 +847,69 @@ var queryDocuments = []*HighScore{
 	{game2, "fran", 33, date(3, 20), nil},
 }
 
-func testQuery(t *testing.T, coll *ds.Collection) {
-	cleanUpTable(t, newHighScore, coll)
-	ctx := context.Background()
-	// (Temporary) skip if the driver does not implement queries.
-	if err := coll.Query().Get(ctx).Next(ctx, &docmap{}); gcerrors.Code(err) == gcerrors.Unimplemented {
-		t.Skip("queries not yet implemented")
-	}
-
-	// Add the query docs.
+func addQueryDocuments(t *testing.T, coll *ds.Collection) {
 	alist := coll.Actions()
 	for _, doc := range queryDocuments {
-		alist.Put(doc)
+		d := *doc
+		alist.Put(&d)
 	}
-	if err := alist.Do(ctx); err != nil {
+	if err := alist.Do(context.Background()); err != nil {
 		t.Fatalf("%+v", err)
 	}
+}
+
+func testGetQueryKeyField(t *testing.T, coll *ds.Collection) {
+	// Query the key field of a collection that has one.
+	// (The collection used for testGetQuery uses a key function rather than a key field.)
+	ctx := context.Background()
+	docs := []docmap{
+		{KeyField: "qkf1", "a": "one"},
+		{KeyField: "qkf2", "a": "two"},
+		{KeyField: "qkf3", "a": "three"},
+	}
+	al := coll.Actions()
+	for _, d := range docs {
+		al.Put(d)
+	}
+	if err := al.Do(ctx); err != nil {
+		t.Fatal(err)
+	}
+	iter := coll.Query().Where(KeyField, "<", "qkf3").Get(ctx)
+	defer iter.Stop()
+	got := mustCollect(ctx, t, iter)
+	want := docs[:2]
+	diff := cmpDiff(got, want, cmpopts.SortSlices(sortByKeyField))
+	if diff != "" {
+		t.Error(diff)
+	}
+
+	// Test that queries with selected fields always return the key and revision fields.
+	iter = coll.Query().Get(ctx, "a")
+	defer iter.Stop()
+	got = mustCollect(ctx, t, iter)
+	for _, d := range docs {
+		checkHasRevisionField(t, d)
+	}
+	diff = cmpDiff(got, docs, cmpopts.SortSlices(sortByKeyField))
+	if diff != "" {
+		t.Error(diff)
+	}
+}
+
+func sortByKeyField(d1, d2 docmap) bool { return d1[KeyField].(string) < d2[KeyField].(string) }
+
+func testGetQuery(t *testing.T, coll *ds.Collection) {
+	ctx := context.Background()
+	addQueryDocuments(t, coll)
 
 	// Query filters should have the same behavior when doing string and number
 	// comparison.
 	tests := []struct {
-		name string
-		q    *ds.Query
-		want func(*HighScore) bool // filters queryDocuments
+		name   string
+		q      *ds.Query
+		fields []docstore.FieldPath       // fields to get
+		want   func(*HighScore) bool      // filters queryDocuments
+		before func(x, y *HighScore) bool // if present, checks result order
 	}{
 		{
 			name: "All",
@@ -851,26 +946,81 @@ func testQuery(t *testing.T, coll *ds.Collection) {
 			q:    coll.Query().Where("Game", "=", game1).Where("Score", ">=", 50),
 			want: func(h *HighScore) bool { return h.Game == game1 && h.Score >= 50 },
 		},
-		// TODO(jba): add this test after adding support for times as filter values (#1906).
-		// {
-		// 	name: "PlayerTime",
-		// 	q:    coll.Query().Where("Player", "=", "mel").Where("Time", ">", date(4, 1)),
-		// 	want: func(h *HighScore) bool { return h.Player == "mel" && h.Time.After(date(4, 1)) },
-		// },
+		{
+			name: "PlayerTime",
+			q:    coll.Query().Where("Player", "=", "mel").Where("Time", ">", date(4, 1)),
+			want: func(h *HighScore) bool { return h.Player == "mel" && h.Time.After(date(4, 1)) },
+		},
+		{
+			name: "ScoreTime",
+			q:    coll.Query().Where("Score", ">=", 50).Where("Time", ">", date(4, 1)),
+			want: func(h *HighScore) bool { return h.Score >= 50 && h.Time.After(date(4, 1)) },
+		},
+		{
+			name:   "AllByPlayerAsc",
+			q:      coll.Query().OrderBy("Player", docstore.Ascending),
+			want:   func(h *HighScore) bool { return true },
+			before: func(h1, h2 *HighScore) bool { return h1.Player < h2.Player },
+		},
+		{
+			name:   "AllByPlayerDesc",
+			q:      coll.Query().OrderBy("Player", docstore.Descending),
+			want:   func(h *HighScore) bool { return true },
+			before: func(h1, h2 *HighScore) bool { return h1.Player > h2.Player },
+		},
+		{
+			name: "GameByPlayerAsc",
+			// We need a filter on Player, and it can't be the empty string (DynamoDB limitation).
+			// So pick any string that sorts less than all valid player names.
+			q: coll.Query().Where("Game", "=", game1).Where("Player", ">", ".").
+				OrderBy("Player", docstore.Ascending),
+			want:   func(h *HighScore) bool { return h.Game == game1 },
+			before: func(h1, h2 *HighScore) bool { return h1.Player < h2.Player },
+		},
+		{
+			// Same as above, but descending.
+			name: "GameByPlayerDesc",
+			q: coll.Query().Where("Game", "=", game1).Where("Player", ">", ".").
+				OrderBy("Player", docstore.Descending),
+			want:   func(h *HighScore) bool { return h.Game == game1 },
+			before: func(h1, h2 *HighScore) bool { return h1.Player > h2.Player },
+		},
+		// TODO(jba): add more OrderBy tests.
+		{
+			name:   "AllWithKeyFields",
+			q:      coll.Query(),
+			fields: []docstore.FieldPath{"Game", "Player"},
+			want: func(h *HighScore) bool {
+				h.Score = 0
+				h.Time = time.Time{}
+				return true
+			},
+		},
+		{
+			name:   "AllWithScore",
+			q:      coll.Query(),
+			fields: []docstore.FieldPath{"Game", "Player", "Score"},
+			want: func(h *HighScore) bool {
+				h.Time = time.Time{}
+				return true
+			},
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got := mustCollectHighScores(ctx, t, tc.q.Get(ctx))
-			for _, g := range got {
-				g.DocstoreRevision = nil
+			got, err := collectHighScores(ctx, tc.q.Get(ctx, tc.fields...))
+			if err != nil {
+				t.Fatal(err)
 			}
-			var want []*HighScore
-			for _, d := range queryDocuments {
-				if tc.want(d) {
-					want = append(want, d)
+			for _, g := range got {
+				if g.DocstoreRevision == nil {
+					t.Errorf("%v missing DocstoreRevision", g)
+				} else {
+					g.DocstoreRevision = nil
 				}
 			}
-			_, err := tc.q.Plan()
+			want := filterHighScores(queryDocuments, tc.want)
+			_, err = tc.q.Plan()
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -878,7 +1028,15 @@ func testQuery(t *testing.T, coll *ds.Collection) {
 				return h1.Game+"|"+h1.Player < h2.Game+"|"+h2.Player
 			}))
 			if diff != "" {
-				t.Error(diff)
+				t.Fatal(diff)
+			}
+			if tc.before != nil {
+				// Verify that the results are sorted according to tc.less.
+				for i := 1; i < len(got); i++ {
+					if tc.before(got[i], got[i-1]) {
+						t.Errorf("%s at %d sorts before previous %s", got[i], i, got[i-1])
+					}
+				}
 			}
 			// We can't assume anything about the query plan. Just verify that Plan returns
 			// successfully.
@@ -887,37 +1045,116 @@ func testQuery(t *testing.T, coll *ds.Collection) {
 			}
 		})
 	}
+	t.Run("Limit", func(t *testing.T) {
+		// For limit, we can't be sure which documents will be returned, only their count.
+		limitQ := coll.Query().Limit(2)
+		got := mustCollectHighScores(ctx, t, limitQ.Get(ctx))
+		if len(got) != 2 {
+			t.Errorf("got %v, wanted two documents", got)
+		}
+	})
+}
 
-	// For limit, we can't be sure which documents will be returned, only their count.
-	limitQ := coll.Query().Limit(2)
-	got := mustCollectHighScores(ctx, t, limitQ.Get(ctx))
-	if len(got) != 2 {
-		t.Errorf("got %v, wanted two documents", got)
+func testDeleteQuery(t *testing.T, coll *ds.Collection) {
+	ctx := context.Background()
+
+	addQueryDocuments(t, coll)
+
+	// Note: these tests are cumulative. If the first test deletes a document, that
+	// change will persist for the second test.
+	tests := []struct {
+		name string
+		q    *ds.Query
+		want func(*HighScore) bool // filters queryDocuments
+	}{
+		{
+			name: "Player",
+			q:    coll.Query().Where("Player", "=", "andy"),
+			want: func(h *HighScore) bool { return h.Player != "andy" },
+		},
+		{
+			name: "Score",
+			q:    coll.Query().Where("Score", ">", 100),
+			want: func(h *HighScore) bool { return h.Score <= 100 },
+		},
+		{
+			name: "All",
+			q:    coll.Query(),
+			want: func(h *HighScore) bool { return false },
+		},
+		// TODO(jba): add a case that requires Firestore to evaluate filters on the client.
+	}
+	prevWant := queryDocuments
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := tc.q.Delete(ctx); err != nil {
+				t.Fatal(err)
+			}
+			got := mustCollectHighScores(ctx, t, coll.Query().Get(ctx))
+			for _, g := range got {
+				g.DocstoreRevision = nil
+			}
+			want := filterHighScores(prevWant, tc.want)
+			prevWant = want
+			diff := cmp.Diff(got, want, cmpopts.SortSlices(func(h1, h2 *HighScore) bool {
+				return h1.Game+"|"+h1.Player < h2.Game+"|"+h2.Player
+			}))
+			if diff != "" {
+				t.Error(diff)
+			}
+		})
 	}
 
-	// Errors are returned from the iterator's Next method.
-	iter := coll.Query().Where("Game", "!=", "").Get(ctx) // != is disallowed
-	var h HighScore
-	err := iter.Next(ctx, &h)
-	if c := gcerrors.Code(err); c != gcerrors.InvalidArgument {
-		t.Errorf("got %v, want InvalidArgument", err)
+	// Using Limit with DeleteQuery should be an error.
+	err := coll.Query().Where("Player", "=", "mel").Limit(1).Delete(ctx)
+	if err == nil {
+		t.Fatal("want error for Limit, got nil")
 	}
 }
 
-// cleanUpTable delete all documents from this collection after test.
-func cleanUpTable(t *testing.T, create func() interface{}, coll *docstore.Collection) {
+func testUpdateQuery(t *testing.T, coll *ds.Collection) {
 	ctx := context.Background()
-	dels := coll.Actions()
-	delFunc := func(doc interface{}) error {
-		dels.Delete(doc)
-		return nil
-	}
-	err := forEach(ctx, coll.Query().Get(ctx), create, delFunc)
+	addQueryDocuments(t, coll)
+
+	err := coll.Query().Where("Player", "=", "fran").Update(ctx, docstore.Mods{"Score": 13, "Time": nil})
 	if err != nil {
-		t.Fatalf("%+v", err)
+		t.Fatal(err)
 	}
-	if err := dels.Do(ctx); err != nil {
-		t.Fatalf("%+v", err)
+	got := mustCollectHighScores(ctx, t, coll.Query().Get(ctx))
+	for _, g := range got {
+		g.DocstoreRevision = nil
+	}
+
+	want := filterHighScores(queryDocuments, func(h *HighScore) bool {
+		if h.Player == "fran" {
+			h.Score = 13
+			h.Time = time.Time{}
+		}
+		return true
+	})
+	diff := cmp.Diff(got, want, cmpopts.SortSlices(func(h1, h2 *HighScore) bool {
+		return h1.Game+"|"+h1.Player < h2.Game+"|"+h2.Player
+	}))
+	if diff != "" {
+		t.Error(diff)
+	}
+}
+
+func filterHighScores(hs []*HighScore, f func(*HighScore) bool) []*HighScore {
+	var res []*HighScore
+	for _, h := range hs {
+		c := *h // Copy in case f modifies its argument.
+		if f(&c) {
+			res = append(res, &c)
+		}
+	}
+	return res
+}
+
+// cleanUpTable delete all documents from this collection after test.
+func cleanUpTable(fataler interface{ Fatalf(string, ...interface{}) }, coll *docstore.Collection) {
+	if err := coll.Query().Delete(context.Background()); err != nil {
+		fataler.Fatalf("%+v", err)
 	}
 }
 
@@ -938,10 +1175,9 @@ func forEach(ctx context.Context, iter *ds.DocumentIterator, create func() inter
 	return nil
 }
 
-func newDocmap() interface{} { return docmap{} }
-
 func mustCollect(ctx context.Context, t *testing.T, iter *ds.DocumentIterator) []docmap {
 	var ms []docmap
+	newDocmap := func() interface{} { return docmap{} }
 	collect := func(m interface{}) error { ms = append(ms, m.(docmap)); return nil }
 	if err := forEach(ctx, iter, newDocmap, collect); err != nil {
 		t.Fatal(err)
@@ -950,16 +1186,23 @@ func mustCollect(ctx context.Context, t *testing.T, iter *ds.DocumentIterator) [
 }
 
 func mustCollectHighScores(ctx context.Context, t *testing.T, iter *ds.DocumentIterator) []*HighScore {
-	var hs []*HighScore
-	collect := func(h interface{}) error { hs = append(hs, h.(*HighScore)); return nil }
-	if err := forEach(ctx, iter, newHighScore, collect); err != nil {
+	hs, err := collectHighScores(ctx, iter)
+	if err != nil {
 		t.Fatal(err)
 	}
 	return hs
 }
 
+func collectHighScores(ctx context.Context, iter *ds.DocumentIterator) ([]*HighScore, error) {
+	var hs []*HighScore
+	collect := func(h interface{}) error { hs = append(hs, h.(*HighScore)); return nil }
+	if err := forEach(ctx, iter, newHighScore, collect); err != nil {
+		return nil, err
+	}
+	return hs, nil
+}
+
 func testMultipleActions(t *testing.T, coll *ds.Collection) {
-	cleanUpTable(t, newDocmap, coll)
 	ctx := context.Background()
 
 	docs := []docmap{
@@ -997,7 +1240,7 @@ func testMultipleActions(t *testing.T, coll *ds.Collection) {
 	}
 	for i, got := range gots {
 		docs[i][docstore.RevisionField] = got[docstore.RevisionField] // copy the revision
-		if diff := cmp.Diff(got, docs[i]); diff != "" {
+		if diff := cmpDiff(got, docs[i]); diff != "" {
 			t.Error(diff)
 		}
 	}
@@ -1012,8 +1255,120 @@ func testMultipleActions(t *testing.T, coll *ds.Collection) {
 	}
 }
 
+func testUnorderedActions(t *testing.T, coll *ds.Collection) {
+	ctx := context.Background()
+
+	defer cleanUpTable(t, coll)
+
+	must := func(err error) {
+		t.Helper()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var docs []docmap
+	for i := 0; i < 9; i++ {
+		docs = append(docs, docmap{KeyField: fmt.Sprintf("testUnorderedActions%d", i), "s": fmt.Sprint(i)})
+	}
+
+	compare := func(gots, wants []docmap) {
+		t.Helper()
+		for i := 0; i < len(gots); i++ {
+			got := gots[i]
+			want := clone(wants[i])
+			want[docstore.RevisionField] = got[docstore.RevisionField]
+			if !cmp.Equal(got, want) {
+				t.Errorf("index #%d:\ngot  %v\nwant %v", i, got, want)
+			}
+		}
+	}
+
+	// Put the first three docs.
+	actions := coll.Actions()
+	for i := 0; i < 6; i++ {
+		actions.Create(docs[i])
+	}
+	must(actions.Do(ctx))
+
+	// Replace the first three and put six more.
+	actions = coll.Actions()
+	for i := 0; i < 3; i++ {
+		docs[i]["s"] = fmt.Sprintf("%d'", i)
+		actions.Replace(docs[i])
+	}
+	for i := 3; i < 9; i++ {
+		actions.Put(docs[i])
+	}
+	must(actions.Do(ctx))
+
+	// Delete the first three, get the second three, and put three more.
+	gdocs := []docmap{
+		{KeyField: docs[3][KeyField]},
+		{KeyField: docs[4][KeyField]},
+		{KeyField: docs[5][KeyField]},
+	}
+	actions = coll.Actions()
+	actions.Update(docs[6], ds.Mods{"s": "6'"})
+	actions.Get(gdocs[0])
+	actions.Delete(docs[0])
+	actions.Delete(docs[1])
+	actions.Update(docs[7], ds.Mods{"s": "7'"})
+	actions.Get(gdocs[1])
+	actions.Delete(docs[2])
+	actions.Get(gdocs[2])
+	actions.Update(docs[8], ds.Mods{"s": "8'"})
+	must(actions.Do(ctx))
+	compare(gdocs, docs[3:6])
+
+	// At this point, the existing documents are 3 - 9.
+
+	// Get the first four, try to create one that already exists, delete a
+	// nonexistent doc, and put one. Only the Get of #3, the Delete and the Put
+	// should succeed.
+	actions = coll.Actions()
+	for _, doc := range []docmap{
+		{KeyField: docs[0][KeyField]},
+		{KeyField: docs[1][KeyField]},
+		{KeyField: docs[2][KeyField]},
+		{KeyField: docs[3][KeyField]},
+	} {
+		actions.Get(doc)
+	}
+	docs[4][ds.RevisionField] = nil
+	actions.Create(docs[4]) // create existing doc
+	actions.Put(docs[5])
+	// TODO(jba): Understand why the following line is necessary for dynamo but not the others.
+	docs[0][ds.RevisionField] = nil
+	actions.Delete(docs[0]) // delete nonexistent doc
+	err := actions.Do(ctx)
+	if err == nil {
+		t.Fatal("want error, got nil")
+	}
+	alerr, ok := err.(docstore.ActionListError)
+	if !ok {
+		t.Fatalf("got %v (%T), want ActionListError", alerr, alerr)
+	}
+	for _, e := range alerr {
+		switch i := e.Index; i {
+		case 3, 5, 6:
+			t.Errorf("index %d: got %v, want nil", i, e.Err)
+
+		case 4, -1: // -1 for mongodb issue, see https://jira.mongodb.org/browse/GODRIVER-1028
+			if ec := gcerrors.Code(e.Err); ec != gcerrors.AlreadyExists &&
+				ec != gcerrors.FailedPrecondition { // TODO(shantuo): distinguish this case for dyanmo
+				t.Errorf("index 4: create an existing document: got %v, want error", e.Err)
+			}
+
+		default:
+			if gcerrors.Code(e.Err) != gcerrors.NotFound {
+				t.Errorf("index %d: got %v, want NotFound", i, e.Err)
+			}
+		}
+	}
+}
+
 func testAs(t *testing.T, coll *ds.Collection, st AsTest) {
-	cleanUpTable(t, newHighScore, coll)
 	docs := []*HighScore{
 		{game3, "steph", 24, date(4, 25), nil},
 		{game3, "mia", 99, date(4, 26), nil},
@@ -1030,8 +1385,21 @@ func testAs(t *testing.T, coll *ds.Collection, st AsTest) {
 	for _, doc := range docs {
 		actions.Put(doc)
 	}
-	if err := actions.Do(ctx); err != nil {
+	if err := actions.BeforeDo(st.BeforeDo).Do(ctx); err != nil {
 		t.Fatal(err)
+	}
+
+	// Get docs
+	gets := coll.Actions()
+	want := docs[0]
+	got := &HighScore{Game: want.Game, Player: want.Player}
+	gets.Get(got)
+	if err := gets.BeforeDo(st.BeforeDo).Do(ctx); err != nil {
+		t.Fatal(err)
+	}
+	want.DocstoreRevision = got.DocstoreRevision
+	if diff := cmpDiff(got, want); diff != "" {
+		t.Error(diff)
 	}
 
 	// Query
@@ -1044,8 +1412,45 @@ func testAs(t *testing.T, coll *ds.Collection, st AsTest) {
 		coll.Query().Where("Score", ">", 50),
 	}
 	for _, q := range qs {
-		if err := st.QueryCheck(q.BeforeQuery(st.BeforeQuery).Get(ctx)); err != nil {
+		iter := q.BeforeQuery(st.BeforeQuery).Get(ctx)
+		if err := st.QueryCheck(iter); err != nil {
 			t.Error(err)
 		}
+	}
+
+	// ErrorCheck
+	doc := &HighScore{game3, "steph", 24, date(4, 25), nil} // docs[0] w/o revision
+	if err := coll.Create(ctx, doc); err == nil {
+		t.Fatal("got nil error from creating an existing item, want an error")
+	} else {
+		if alerr, ok := err.(docstore.ActionListError); ok {
+			for _, aerr := range alerr {
+				if checkerr := st.ErrorCheck(coll, aerr.Err); checkerr != nil {
+					t.Error(checkerr)
+				}
+			}
+		} else if checkerr := st.ErrorCheck(coll, err); checkerr != nil {
+			t.Error(checkerr)
+		}
+	}
+}
+
+func clone(m docmap) docmap {
+	r := docmap{}
+	for k, v := range m {
+		r[k] = v
+	}
+	return r
+}
+
+func cmpDiff(a, b interface{}, opts ...cmp.Option) string {
+	// Firestore revisions can be protos.
+	return cmp.Diff(a, b, append([]cmp.Option{cmp.Comparer(proto.Equal)}, opts...)...)
+}
+
+func checkCode(t *testing.T, err error, code gcerrors.ErrorCode) {
+	t.Helper()
+	if gcerrors.Code(err) != code {
+		t.Errorf("got %v, want %s", err, code)
 	}
 }

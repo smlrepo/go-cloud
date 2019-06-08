@@ -25,14 +25,16 @@
 // https://cloud.google.com/docs/authentication/production.
 // To customize the URL opener, or for more details on the URL format,
 // see URLOpener.
-// See https://godoc.org/gocloud.dev#hdr-URLs for background information.
+// See https://gocloud.dev/concepts/urls/ for background information.
 //
 // As
 //
 // firedocstore exposes the following types for As:
 // - Collection.As: *firestore.Client
+// - ActionList.BeforeDo: *pb.BatchGetDocumentRequest or *pb.CommitRequest.
 // - Query.BeforeQuery: *firestore.RunQueryRequest
 // - DocumentIterator: firestore.Firestore_RunQueryClient
+// - Error: *google.golang.org/grpc/status.Status
 package firedocstore
 
 import (
@@ -48,7 +50,7 @@ import (
 	"sync"
 
 	vkit "cloud.google.com/go/firestore/apiv1"
-	ts "github.com/golang/protobuf/ptypes/timestamp"
+	tspb "github.com/golang/protobuf/ptypes/timestamp"
 	"gocloud.dev/gcp"
 	"gocloud.dev/internal/docstore"
 	"gocloud.dev/internal/docstore/driver"
@@ -57,6 +59,7 @@ import (
 	"google.golang.org/api/option"
 	pb "google.golang.org/genproto/googleapis/firestore/v1"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 )
 
 func init() {
@@ -155,11 +158,15 @@ type collection struct {
 	client    *vkit.Client
 	dbPath    string // e.g. "projects/P/databases/(default)"
 	collPath  string // e.g. "projects/P/databases/(default)/documents/States/Wisconsin/cities"
-
+	opts      *Options
 }
 
 // Options contains optional arguments to the OpenCollection functions.
-type Options struct{}
+type Options struct {
+	// If true, allow queries that require client-side evaluation of filters (Where clauses)
+	// to run.
+	AllowLocalFilters bool
+}
 
 // OpenCollection creates a *docstore.Collection representing a Firestore collection.
 //
@@ -170,8 +177,8 @@ type Options struct{}
 // firedocstore requires that a single string field, nameField, be designated the
 // primary key. Its values must be unique over all documents in the collection, and
 // the primary key must be provided to retrieve a document.
-func OpenCollection(client *vkit.Client, projectID, collPath, nameField string, _ *Options) (*docstore.Collection, error) {
-	c, err := newCollection(client, projectID, collPath, nameField, nil)
+func OpenCollection(client *vkit.Client, projectID, collPath, nameField string, opts *Options) (*docstore.Collection, error) {
+	c, err := newCollection(client, projectID, collPath, nameField, nil, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -188,112 +195,122 @@ func OpenCollection(client *vkit.Client, projectID, collPath, nameField string, 
 // be used for the document's primary key. It should return the empty string if the
 // document is missing the information to construct a name. This will cause all
 // actions, even Create, to fail.
-func OpenCollectionWithNameFunc(client *vkit.Client, projectID, collPath string, nameFunc func(docstore.Document) string, _ *Options) (*docstore.Collection, error) {
-	c, err := newCollection(client, projectID, collPath, "", nameFunc)
+func OpenCollectionWithNameFunc(client *vkit.Client, projectID, collPath string, nameFunc func(docstore.Document) string, opts *Options) (*docstore.Collection, error) {
+	c, err := newCollection(client, projectID, collPath, "", nameFunc, opts)
 	if err != nil {
 		return nil, err
 	}
 	return docstore.NewCollection(c), nil
 }
 
-func newCollection(client *vkit.Client, projectID, collPath, nameField string, nameFunc func(docstore.Document) string) (*collection, error) {
+func newCollection(client *vkit.Client, projectID, collPath, nameField string, nameFunc func(docstore.Document) string, opts *Options) (*collection, error) {
 	if nameField == "" && nameFunc == nil {
 		return nil, gcerr.Newf(gcerr.InvalidArgument, nil, "one of nameField or nameFunc must be provided")
 	}
 	dbPath := fmt.Sprintf("projects/%s/databases/(default)", projectID)
+	if opts == nil {
+		opts = &Options{}
+	}
 	return &collection{
 		client:    client,
 		nameField: nameField,
 		nameFunc:  nameFunc,
 		dbPath:    dbPath,
 		collPath:  fmt.Sprintf("%s/documents/%s", dbPath, collPath),
+		opts:      opts,
 	}, nil
+}
+
+// Key returns the document key, if present. This is either the value of the field
+// called c.nameField, or the result of calling c.nameFunc.
+func (c *collection) Key(doc driver.Document) (interface{}, error) {
+	if c.nameField != "" {
+		name, err := doc.GetField(c.nameField)
+		if err != nil {
+			// missing field is not an error
+			return nil, nil
+		}
+		// Check that the reflect kind is String so we can support any type whose underlying type
+		// is string. E.g. "type DocName string".
+		vn := reflect.ValueOf(name)
+		if vn.Kind() != reflect.String {
+			return nil, gcerr.Newf(gcerr.InvalidArgument, nil, "key field %q with value %v is not a string",
+				c.nameField, name)
+		}
+		sname := vn.String()
+		if sname == "" { // empty string is the same as missing
+			return nil, nil
+		}
+		return sname, nil
+	}
+	sname := c.nameFunc(doc.Origin)
+	if sname == "" {
+		return nil, gcerr.Newf(gcerr.InvalidArgument, nil, "missing document key")
+	}
+	return sname, nil
+}
+
+func (c *collection) RevisionField() string {
+	return ""
 }
 
 // RunActions implements driver.RunActions.
 func (c *collection) RunActions(ctx context.Context, actions []*driver.Action, opts *driver.RunActionsOptions) driver.ActionListError {
-	if opts.Unordered {
-		return c.runActionsUnordered(ctx, actions)
-	}
-	return c.runActionsOrdered(ctx, actions)
-}
-
-func (c *collection) runActionsOrdered(ctx context.Context, actions []*driver.Action) driver.ActionListError {
-	// Split the actions into groups, each of which can be done with a single RPC.
-	// - Consecutive writes are grouped together.
-	// - Consecutive gets with the same field paths are grouped together.
-	// TODO(jba): when we have transforms, apply the constraint that at most one transform per document
-	// is allowed in a given request (see write.proto).
-	groups := driver.SplitActions(actions, shouldSplit)
-	nRun := 0 // number of actions successfully run
-	var n int
-	var err error
-	for _, g := range groups {
-		if g[0].Kind == driver.Get {
-			n, err = c.runGetsOrdered(ctx, g)
-			nRun += n
-		} else {
-			err = c.runWrites(ctx, g)
-			// Writes happen atomically: all or none.
-			if err != nil {
-				nRun += len(g)
-			}
-		}
-		if err != nil {
-			return driver.ActionListError{{nRun, err}}
-		}
-	}
-	return nil
-}
-
-// Reports whether two consecutive actions in a list should be split into different groups.
-func shouldSplit(cur, new *driver.Action) bool {
-	// If the new action isn't a Get but the current group consists of Gets, split.
-	if new.Kind != driver.Get && cur.Kind == driver.Get {
-		return true
-	}
-	// If the new  action is a Get and either (1) the current group consists of writes, or (2) the current group
-	// of gets has a different list of field paths to retrieve, then split.
-	// (The BatchGetDocuments RPC we use for Gets supports only a single set of field paths.)
-	return new.Kind == driver.Get && (cur.Kind != driver.Get || !fpsEqual(cur.FieldPaths, new.FieldPaths))
-}
-
-// Run a sequence of Get actions by calling the BatchGetDocuments RPC.
-// It returns the number of initial successful gets, as well as an error.
-func (c *collection) runGetsOrdered(ctx context.Context, gets []*driver.Action) (int, error) {
-	errs := c.runGets(ctx, gets)
-	for i, err := range errs {
-		if err != nil {
-			return i, err
-		}
-	}
-	return len(gets), nil
+	errs := make([]error, len(actions))
+	beforeGets, gets, writes, afterGets := driver.GroupActions(actions)
+	c.runGets(ctx, beforeGets, errs, opts)
+	ch := make(chan struct{})
+	go func() { defer close(ch); c.runWrites(ctx, writes, errs, opts) }()
+	c.runGets(ctx, gets, errs, opts)
+	<-ch
+	c.runGets(ctx, afterGets, errs, opts)
+	return driver.NewActionListError(errs)
 }
 
 // runGets executes a group of Get actions by calling the BatchGetDocuments RPC.
-// It returns the error for each Get action in order.
-func (c *collection) runGets(ctx context.Context, gets []*driver.Action) []error {
-	errs := make([]error, len(gets))
+// It may make several calls, because all gets in a single RPC must have the same set of field paths.
+func (c *collection) runGets(ctx context.Context, actions []*driver.Action, errs []error, opts *driver.RunActionsOptions) {
+	for _, group := range driver.GroupByFieldPath(actions) {
+		c.batchGet(ctx, group, errs, opts)
+	}
+}
+
+// Run a single BatchGet RPC with the given Get actions, all of which have the same set of field paths.
+// Populate errs, a slice of per-action errors indexed by the original action list position.
+func (c *collection) batchGet(ctx context.Context, gets []*driver.Action, errs []error, opts *driver.RunActionsOptions) {
 	setErr := func(err error) {
-		for i := range errs {
-			errs[i] = err
+		for _, g := range gets {
+			errs[g.Index] = err
 		}
 	}
 
 	req, err := c.newGetRequest(gets)
 	if err != nil {
 		setErr(err)
-		return errs
+		return
 	}
-
-	indexByPath := map[string]int{} // from document path to index in gets slice
+	indexByPath := map[string]int{} // from document path to index in gets
 	for i, path := range req.Documents {
 		indexByPath[path] = i
+	}
+	if opts.BeforeDo != nil {
+		asFunc := func(i interface{}) bool {
+			p, ok := i.(**pb.BatchGetDocumentsRequest)
+			if !ok {
+				return false
+			}
+			*p = req
+			return true
+		}
+		if err := opts.BeforeDo(asFunc); err != nil {
+			setErr(err)
+			return
+		}
 	}
 	streamClient, err := c.client.BatchGetDocuments(withResourceHeader(ctx, req.Database), req)
 	if err != nil {
 		setErr(err)
-		return errs
+		return
 	}
 	for {
 		resp, err := streamClient.Recv()
@@ -302,37 +319,31 @@ func (c *collection) runGets(ctx context.Context, gets []*driver.Action) []error
 		}
 		if err != nil {
 			setErr(err)
-			return errs
+			return
 		}
 		switch r := resp.Result.(type) {
 		case *pb.BatchGetDocumentsResponse_Found:
 			pdoc := r.Found
-			i := indexByPath[pdoc.Name]
-			errs[i] = decodeDoc(pdoc, gets[i].Doc, c.nameField)
+			i, ok := indexByPath[pdoc.Name]
+			if !ok {
+				setErr(gcerr.Newf(gcerr.Internal, nil, "no index for path %s", pdoc.Name))
+			} else {
+				errs[gets[i].Index] = decodeDoc(pdoc, gets[i].Doc, c.nameField)
+			}
 		case *pb.BatchGetDocumentsResponse_Missing:
 			i := indexByPath[r.Missing]
-			errs[i] = gcerr.Newf(gcerr.NotFound, nil, "document at path %q is missing", r.Missing)
+			errs[gets[i].Index] = gcerr.Newf(gcerr.NotFound, nil, "document at path %q is missing", r.Missing)
 		default:
 			setErr(gcerr.Newf(gcerr.Internal, nil, "unknown BatchGetDocumentsResponse result type"))
-			return errs
+			return
 		}
 	}
-	return errs
 }
 
 func (c *collection) newGetRequest(gets []*driver.Action) (*pb.BatchGetDocumentsRequest, error) {
 	req := &pb.BatchGetDocumentsRequest{Database: c.dbPath}
-	seen := map[string]bool{}
 	for _, a := range gets {
-		docName, _, err := c.docName(a.Doc)
-		if err != nil {
-			return nil, err
-		}
-		if seen[docName] {
-			return nil, gcerr.Newf(gcerr.InvalidArgument, nil, "duplicate document name in Get: %q", docName)
-		}
-		req.Documents = append(req.Documents, c.collPath+"/"+docName)
-		seen[docName] = true
+		req.Documents = append(req.Documents, c.collPath+"/"+a.Key.(string))
 	}
 	// groupActions has already made sure that all the actions have the same field paths,
 	// so just use the first one.
@@ -346,61 +357,71 @@ func (c *collection) newGetRequest(gets []*driver.Action) (*pb.BatchGetDocuments
 	return req, nil
 }
 
+// commitCall holds information needed to make a Commit RPC and to follow up after it is done.
+type commitCall struct {
+	writes   []*pb.Write      // writes to commit
+	actions  []*driver.Action // actions corresponding to those writes
+	newNames []string         // new names for Create; parallel to actions
+}
+
 // runWrites executes all the actions in a single RPC. The actions are done atomically,
 // so either they all succeed or they all fail.
-func (c *collection) runWrites(ctx context.Context, actions []*driver.Action) error {
+func (c *collection) runWrites(ctx context.Context, actions []*driver.Action, errs []error, opts *driver.RunActionsOptions) {
 	// Convert each action to one or more writes, collecting names for newly created
-	// documents along the way.
-	var pws []*pb.Write
-	newNames := make([]string, len(actions)) // from Creates without a name
-	for i, a := range actions {
+	// documents along the way. Divide writes into those with preconditions and those without.
+	// Writes without preconditions can't fail, so we can execute them all in one Commit RPC.
+	// All other writes must be run as separate Commits.
+	var (
+		nCall  = &commitCall{} // for writes without preconditions
+		pCalls []*commitCall   // for writes with preconditions
+	)
+	for _, a := range actions {
 		ws, nn, err := c.actionToWrites(a)
 		if err != nil {
-			return err
-		}
-		newNames[i] = nn
-		pws = append(pws, ws...)
-	}
-	// Call the Commit RPC with the list of writes.
-	wrs, err := c.commit(ctx, pws)
-	if err != nil {
-		return err
-	}
-	// Now that we've successfully done the action, set the names for newly created docs
-	// that weren't given a name by the caller.
-	for i, nn := range newNames {
-		if nn != "" {
-			_ = actions[i].Doc.SetField(c.nameField, nn)
+			errs[a.Index] = err
+		} else if ws[0].CurrentDocument == nil { // no precondition
+			nCall.writes = append(nCall.writes, ws...)
+			nCall.actions = append(nCall.actions, a)
+			nCall.newNames = append(nCall.newNames, nn)
+		} else { // writes have a precondition
+			pCalls = append(pCalls, &commitCall{
+				writes:   ws,
+				actions:  []*driver.Action{a},
+				newNames: []string{nn},
+			})
 		}
 	}
-	// TODO(jba): should we set the revision fields of all docs to the returned update times?
-	// We should only do this if we can for all providers.
-	_ = wrs
-	// for i, wr := range wrs {
-	// 	// Ignore errors. It's fine if the doc doesn't have a revision field.
-	// 	// (We also could get an error if that field is unsettable for some reason, but
-	// 	// we just decide to ignore those as well.)
-	// 	_ = actions[i].Doc.SetField(docstore.RevisionField, wr.UpdateTime)
-	// }
-	return nil
+	// Run the commit calls concurrently.
+	// TODO(jba): limit number of outstanding RPCs.
+	calls := append(pCalls, nCall)
+	var wg sync.WaitGroup
+	for _, call := range calls {
+		call := call
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			c.doCommitCall(ctx, call, errs, opts)
+		}()
+	}
+	wg.Wait()
 }
 
 // Convert an action to one or more Firestore Write protos.
 func (c *collection) actionToWrites(a *driver.Action) ([]*pb.Write, string, error) {
-	docName, missingField, err := c.docName(a.Doc)
-	// Return the error unless the field is missing and this is a Create action.
-	if err != nil && !(missingField && a.Kind == driver.Create) {
-		return nil, "", err
-	}
 	var (
 		w       *pb.Write
 		ws      []*pb.Write
+		err     error
+		docName string
 		newName string // for Create with no name
 	)
+	if a.Key != nil {
+		docName = a.Key.(string)
+	}
 	switch a.Kind {
 	case driver.Create:
 		// Make a name for this document if it doesn't have one.
-		if missingField {
+		if a.Key == nil {
 			docName = driver.UniqueString()
 			newName = docName
 		}
@@ -408,9 +429,9 @@ func (c *collection) actionToWrites(a *driver.Action) ([]*pb.Write, string, erro
 
 	case driver.Replace:
 		// If the given document has a revision, use it as the precondition (it implies existence).
-		pc, err := revisionPrecondition(a.Doc)
-		if err != nil {
-			return nil, "", err
+		pc, perr := revisionPrecondition(a.Doc)
+		if perr != nil {
+			return nil, "", perr
 		}
 		// Otherwise, just require that the document exists.
 		if pc == nil {
@@ -419,9 +440,9 @@ func (c *collection) actionToWrites(a *driver.Action) ([]*pb.Write, string, erro
 		w, err = c.putWrite(a.Doc, docName, pc)
 
 	case driver.Put:
-		pc, err := revisionPrecondition(a.Doc)
-		if err != nil {
-			return nil, "", err
+		pc, perr := revisionPrecondition(a.Doc)
+		if perr != nil {
+			return nil, "", perr
 		}
 		w, err = c.putWrite(a.Doc, docName, pc)
 
@@ -469,79 +490,146 @@ func (c *collection) deleteWrite(doc driver.Document, docName string) (*pb.Write
 // updateWrites returns a slice of writes because we may need two: one for setting
 // and deleting values, the other for transforms.
 func (c *collection) updateWrites(doc driver.Document, docName string, mods []driver.Mod) ([]*pb.Write, error) {
-	pc, err := revisionPrecondition(doc)
+	ts, err := revisionTimestamp(doc)
 	if err != nil {
 		return nil, err
 	}
+	fields, paths, transforms, err := processMods(mods)
+	if err != nil {
+		return nil, err
+	}
+	return newUpdateWrites(c.collPath+"/"+docName, ts, fields, paths, transforms)
+}
+
+func newUpdateWrites(docPath string, ts *tspb.Timestamp, fields map[string]*pb.Value, paths []string, transforms []*pb.DocumentTransform_FieldTransform) ([]*pb.Write, error) {
+	pc := preconditionFromTimestamp(ts)
 	// If there is no revision in the document, add a precondition that the document exists.
 	if pc == nil {
 		pc = &pb.Precondition{ConditionType: &pb.Precondition_Exists{Exists: true}}
 	}
-	pdoc := &pb.Document{
-		Name:   c.collPath + "/" + docName,
-		Fields: map[string]*pb.Value{},
+	var ws []*pb.Write
+	if len(fields) > 0 || len(paths) > 0 {
+		ws = []*pb.Write{{
+			Operation: &pb.Write_Update{Update: &pb.Document{
+				Name:   docPath,
+				Fields: fields,
+			}},
+			UpdateMask:      &pb.DocumentMask{FieldPaths: paths},
+			CurrentDocument: pc,
+		}}
+		pc = nil // If the precondition is in the write, we don't need it in the transform.
 	}
-	// To update a document, we need to send:
-	// - A document with all the fields we want to add or change.
-	// - A mask with the field paths of all the fields we want to add, change or delete.
-	var fps []string // field paths that will go in the mask
+	if len(transforms) > 0 {
+		ws = append(ws, &pb.Write{
+			Operation: &pb.Write_Transform{
+				Transform: &pb.DocumentTransform{
+					Document:        docPath,
+					FieldTransforms: transforms,
+				},
+			},
+			CurrentDocument: pc,
+		})
+	}
+	return ws, nil
+}
+
+// To update a document, we need to send:
+// - A document with all the fields we want to add or change.
+// - A mask with the field paths of all the fields we want to add, change or delete.
+// processMods converts the mods into the fields for the document, and a list of
+// valid Firestore field paths for the mask.
+func processMods(mods []driver.Mod) (fields map[string]*pb.Value, maskPaths []string, transforms []*pb.DocumentTransform_FieldTransform, err error) {
+	fields = map[string]*pb.Value{}
 	for _, m := range mods {
-		// The field path of every mod belongs in the mask.
-		fps = append(fps, toServiceFieldPath(m.FieldPath))
+		sfp := toServiceFieldPath(m.FieldPath)
 		// If m.Value is nil, we want to delete it. In that case, we put the field in
 		// the mask but not in the doc.
-		if m.Value != nil {
-			pv, err := encodeValue(m.Value)
+		if inc, ok := m.Value.(driver.IncOp); ok {
+			pv, err := encodeValue(inc.Amount)
 			if err != nil {
-				return nil, err
+				return nil, nil, nil, err
 			}
-			if err := setAtFieldPath(pdoc.Fields, m.FieldPath, pv); err != nil {
-				return nil, err
+			transforms = append(transforms, &pb.DocumentTransform_FieldTransform{
+				FieldPath: sfp,
+				TransformType: &pb.DocumentTransform_FieldTransform_Increment{
+					Increment: pv,
+				},
+			})
+		} else {
+			// The field path of every other mod belongs in the mask.
+			maskPaths = append(maskPaths, sfp)
+			if m.Value != nil {
+				pv, err := encodeValue(m.Value)
+				if err != nil {
+					return nil, nil, nil, err
+				}
+				if err := setAtFieldPath(fields, m.FieldPath, pv); err != nil {
+					return nil, nil, nil, err
+				}
 			}
 		}
 	}
-	w := &pb.Write{
-		Operation:       &pb.Write_Update{Update: pdoc},
-		UpdateMask:      &pb.DocumentMask{FieldPaths: fps},
-		CurrentDocument: pc,
-	}
-	// For now, we don't have any transforms.
-	return []*pb.Write{w}, nil
+	return fields, maskPaths, transforms, nil
 }
 
-func (c *collection) runActionsUnordered(ctx context.Context, actions []*driver.Action) driver.ActionListError {
-	// Split into groups the same way, but run them concurrently.
-	// TODO(jba): group without considering order.
-	groups := driver.SplitActions(actions, shouldSplit)
-	errs := make([]error, len(actions))
-	var wg sync.WaitGroup
-	groupBaseIndex := 0 // index in actions of first action in group
-	for _, g := range groups {
-		g := g
-		base := groupBaseIndex
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			if g[0].Kind == driver.Get {
-				errs := c.runGets(ctx, g)
-				for i, err := range errs {
-					errs[base+i] = err
-				}
-			} else {
-				err := c.runWrites(ctx, g)
-				// Writes run in a transaction, so there is a single error for the group.
-				for i := 0; i < len(g); i++ {
-					errs[base+i] = err
-				}
+// doCommitCall Calls the Commit RPC with a list of writes, and handles the results.
+func (c *collection) doCommitCall(ctx context.Context, call *commitCall, errs []error, opts *driver.RunActionsOptions) {
+	wrs, err := c.commit(ctx, call.writes, opts)
+	if err != nil {
+		for _, a := range call.actions {
+			errs[a.Index] = err
+		}
+		return
+	}
+	_ = wrs
+	// Set the revision fields of the documents.
+	// The actions and writes may not correspond, because Update actions may require
+	// two writes. We can tell which writes correspond to actions by the type of write.
+	j := 0
+	for i, wr := range wrs {
+		if _, ok := call.writes[i].Operation.(*pb.Write_Transform); !ok {
+			// Ignore errors. It's fine if the doc doesn't have a revision field.
+			call.actions[j].Doc.SetField(docstore.RevisionField, wr.UpdateTime)
+			j++
+		}
+	}
+	// Set new names for Create actions.
+	for i, a := range call.actions {
+		if call.newNames[i] != "" {
+			_ = a.Doc.SetField(c.nameField, call.newNames[i])
+		}
+	}
+}
+
+func (c *collection) commit(ctx context.Context, ws []*pb.Write, opts *driver.RunActionsOptions) ([]*pb.WriteResult, error) {
+	req := &pb.CommitRequest{
+		Database: c.dbPath,
+		Writes:   ws,
+	}
+	if opts.BeforeDo != nil {
+		asFunc := func(i interface{}) bool {
+			p, ok := i.(**pb.CommitRequest)
+			if !ok {
+				return false
 			}
-		}()
-		groupBaseIndex += len(g)
+			*p = req
+			return true
+		}
+		if err := opts.BeforeDo(asFunc); err != nil {
+			return nil, err
+		}
 	}
-	wg.Wait()
-	return driver.NewActionListError(errs)
+	res, err := c.client.Commit(withResourceHeader(ctx, req.Database), req)
+	if err != nil {
+		return nil, err
+	}
+	if len(res.WriteResults) != len(ws) {
+		return nil, gcerr.Newf(gcerr.Internal, nil, "wrong number of WriteResults from firestore commit")
+	}
+	return res.WriteResults, nil
 }
 
-////////////////
+///////////////
 // From memdocstore/mem.go.
 
 // setAtFieldPath sets m's value at fp to val. It creates intermediate maps as
@@ -616,6 +704,16 @@ func toServiceFieldPathComponent(key string) string {
 // revisionPrecondition returns a Firestore precondition that asserts that the stored document's
 // revision matches the revision of doc.
 func revisionPrecondition(doc driver.Document) (*pb.Precondition, error) {
+	rev, err := revisionTimestamp(doc)
+	if err != nil {
+		return nil, err
+	}
+	return preconditionFromTimestamp(rev), nil
+}
+
+// revisionTimestamp extracts the timestamp from the revision field of doc, if there is one.
+// It only returns an error if the revision field is present and does not contain the right type.
+func revisionTimestamp(doc driver.Document) (*tspb.Timestamp, error) {
 	v, err := doc.GetField(docstore.RevisionField)
 	if err != nil { // revision field not present
 		return nil, nil
@@ -623,93 +721,20 @@ func revisionPrecondition(doc driver.Document) (*pb.Precondition, error) {
 	if v == nil { // revision field is present, but nil
 		return nil, nil
 	}
-	rev, ok := v.(*ts.Timestamp)
+	rev, ok := v.(*tspb.Timestamp)
 	if !ok {
 		return nil, gcerr.Newf(gcerr.InvalidArgument, nil,
 			"%s field contains wrong type: got %T, want proto Timestamp",
 			docstore.RevisionField, v)
 	}
-	if rev == nil || (rev.Seconds == 0 && rev.Nanos == 0) { // ignore a missing or zero revision
-		return nil, nil
-	}
-	return &pb.Precondition{ConditionType: &pb.Precondition_UpdateTime{rev}}, nil
+	return rev, nil
 }
 
-// TODO(jba): make sure we enforce these Firestore commit constraints:
-// - At most one `transform` per document is allowed in a given request.
-// - An `update` cannot follow a `transform` on the same document in a given request.
-// These should actually happen in groupActions.
-func (c *collection) commit(ctx context.Context, ws []*pb.Write) ([]*pb.WriteResult, error) {
-	req := &pb.CommitRequest{
-		Database: c.dbPath,
-		Writes:   ws,
+func preconditionFromTimestamp(ts *tspb.Timestamp) *pb.Precondition {
+	if ts == nil || (ts.Seconds == 0 && ts.Nanos == 0) { // ignore a missing or zero revision
+		return nil
 	}
-	res, err := c.client.Commit(withResourceHeader(ctx, req.Database), req)
-	if err != nil {
-		return nil, err
-	}
-	if len(res.WriteResults) != len(ws) {
-		return nil, gcerr.Newf(gcerr.Internal, nil, "wrong number of WriteResults from firestore commit")
-	}
-	return res.WriteResults, nil
-}
-
-// docName returns the name of the document. This is either the value of the field
-// called c.nameField, or the result of calling c.nameFunc. It must be a
-// string.
-// docName returns an error if:
-// 1. c.nameField is not empty, but the field isn't present in the doc, or
-// 2. c.nameFunc is non-nil, but returns "".
-// The second return value reports whether c.nameField is not-empty and the field is
-// missing. This is to support the Create action, which can create new document
-// names.
-func (c *collection) docName(doc driver.Document) (string, bool, error) {
-	if c.nameField != "" {
-		name, err := doc.GetField(c.nameField)
-		if err != nil {
-			return "", true, gcerr.Newf(gcerr.InvalidArgument, nil, "missing name field %s", c.nameField)
-		}
-		// Check that the reflect kind is String so we can support any type whose underlying type
-		// is string. E.g. "type DocName string".
-		vn := reflect.ValueOf(name)
-		if vn.Kind() != reflect.String {
-			return "", false, gcerr.Newf(gcerr.InvalidArgument, nil, "key field %q with value %v is not a string",
-				c.nameField, name)
-		}
-		return vn.String(), false, nil
-	}
-	name := c.nameFunc(doc.Origin)
-	if name == "" {
-		return "", false, gcerr.Newf(gcerr.InvalidArgument, nil, "missing name")
-	}
-	return name, false, nil
-}
-
-// Report whether two lists of field paths are equal.
-func fpsEqual(fps1, fps2 [][]string) bool {
-	// TODO?: We really care about sets of field paths, but that's too tedious to determine.
-	if len(fps1) != len(fps2) {
-		return false
-	}
-	for i, fp1 := range fps1 {
-		if !fpEqual(fp1, fps2[i]) {
-			return false
-		}
-	}
-	return true
-}
-
-// Report whether two field paths are equal.
-func fpEqual(fp1, fp2 []string) bool {
-	if len(fp1) != len(fp2) {
-		return false
-	}
-	for i, s1 := range fp1 {
-		if s1 != fp2[i] {
-			return false
-		}
-	}
-	return true
+	return &pb.Precondition{ConditionType: &pb.Precondition_UpdateTime{ts}}
 }
 
 func (c *collection) ErrorCode(err error) gcerr.ErrorCode {
@@ -735,5 +760,19 @@ func (c *collection) As(i interface{}) bool {
 		return false
 	}
 	*p = c.client
+	return true
+}
+
+// ErrorAs implements driver.Collection.ErrorAs.
+func (c *collection) ErrorAs(err error, i interface{}) bool {
+	s, ok := status.FromError(err)
+	if !ok {
+		return false
+	}
+	p, ok := i.(**status.Status)
+	if !ok {
+		return false
+	}
+	*p = s
 	return true
 }

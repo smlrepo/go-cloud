@@ -25,7 +25,7 @@
 // for the scheme "mem".
 // To customize the URL opener, or for more details on the URL format,
 // see URLOpener.
-// See https://godoc.org/gocloud.dev#hdr-URLs for background information.
+// See https://gocloud.dev/concepts/urls/ for background information.
 //
 // Message Delivery Semantics
 //
@@ -359,9 +359,6 @@ func (*subscription) ErrorCode(err error) gcerrors.ErrorCode {
 	}
 	return gcerrors.Unknown
 }
-
-// AckFunc implements driver.Subscription.AckFunc.
-func (*subscription) AckFunc() func() { return nil }
 
 // Close implements driver.Subscription.Close.
 func (*subscription) Close() error { return nil }

@@ -16,43 +16,43 @@ package main
 
 import (
 	"context"
-	"flag"
 	"os"
-	"os/exec"
 	"path/filepath"
+	"strconv"
 
+	"github.com/spf13/cobra"
 	"golang.org/x/xerrors"
 )
 
-func apply(ctx context.Context, pctx *processContext, args []string) error {
-	f := newFlagSet(pctx, "apply")
-	if err := f.Parse(args); xerrors.Is(err, flag.ErrHelp) {
-		return nil
-	} else if err != nil {
-		return usagef("gocdk apply: %w", err)
+func registerApplyCmd(ctx context.Context, pctx *processContext, rootCmd *cobra.Command) {
+	var input bool
+	applyCmd := &cobra.Command{
+		Use:   "apply BIOME",
+		Short: "TODO Apply Terraform for BIOME",
+		Long:  "TODO more about apply",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(_ *cobra.Command, args []string) error {
+			return apply(ctx, pctx, args[0], input)
+		},
 	}
+	applyCmd.Flags().BoolVar(&input, "input", true, "ask for input for Terraform variables if not directly set")
+	rootCmd.AddCommand(applyCmd)
+}
 
-	if f.NArg() != 1 {
-		return usagef("gocdk apply BIOME")
-	}
-	biome := f.Arg(0)
-	moduleRoot, err := findModuleRoot(ctx, pctx.workdir)
+func apply(ctx context.Context, pctx *processContext, biome string, input bool) error {
+	moduleRoot, err := pctx.ModuleRoot(ctx)
 	if err != nil {
 		return xerrors.Errorf("apply %s: %w", biome, err)
 	}
 
-	if err := ensureTerraformInit(ctx, pctx, moduleRoot, biome); err != nil {
+	if err := ensureTerraformInit(ctx, pctx, moduleRoot, biome, input); err != nil {
 		return xerrors.Errorf("apply %s: %w", biome, err)
 	}
 
 	// TODO(#1821): take over steps (plan, confirm, apply) so we can
 	// dictate the messaging and errors. We should visually differentiate
 	// when we insert verbiage on top of terraform.
-	c := exec.CommandContext(ctx, "terraform", "apply")
-	c.Dir = findBiomeDir(moduleRoot, biome)
-	c.Stdin = pctx.stdin
-	c.Stdout = pctx.stdout
-	c.Stderr = pctx.stderr
+	c := pctx.NewCommand(ctx, biomeDir(moduleRoot, biome), "terraform", "apply", "-input="+strconv.FormatBool(input))
 	if err := c.Run(); err != nil {
 		return xerrors.Errorf("apply %s: %w", biome, err)
 	}
@@ -61,9 +61,9 @@ func apply(ctx context.Context, pctx *processContext, args []string) error {
 
 // ensureTerraformInit checks for a .terraform directory at the biome root.
 // If one doesn't exist, ensureTerraformInit runs terraform init.
-func ensureTerraformInit(ctx context.Context, pctx *processContext, moduleRoot, biome string) error {
+func ensureTerraformInit(ctx context.Context, pctx *processContext, moduleRoot, biome string, input bool) error {
 	// Check for .terraform directory.
-	biomePath := findBiomeDir(moduleRoot, biome)
+	biomePath := biomeDir(moduleRoot, biome)
 	_, err := os.Stat(filepath.Join(biomePath, ".terraform"))
 	if err == nil {
 		// .terraform exists, no op.
@@ -90,10 +90,7 @@ func ensureTerraformInit(ctx context.Context, pctx *processContext, moduleRoot, 
 	}
 
 	// Biome exists but not initialized. Need to run terraform init.
-	c := exec.CommandContext(ctx, "terraform", "init")
-	c.Dir = biomePath
-	c.Stdout = pctx.stdout
-	c.Stderr = pctx.stderr
+	c := pctx.NewCommand(ctx, biomePath, "terraform", "init", "-input="+strconv.FormatBool(input))
 	if err := c.Run(); err != nil {
 		return xerrors.Errorf("ensure terraform init: %w", err)
 	}

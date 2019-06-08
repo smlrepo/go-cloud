@@ -22,13 +22,13 @@ import (
 
 	vkit "cloud.google.com/go/firestore/apiv1"
 	"github.com/golang/protobuf/proto"
-	"gocloud.dev/gcerrors"
 	"gocloud.dev/internal/docstore"
 	"gocloud.dev/internal/docstore/driver"
 	"gocloud.dev/internal/docstore/drivertest"
 	"gocloud.dev/internal/testing/setup"
 	"google.golang.org/api/option"
 	pb "google.golang.org/genproto/googleapis/firestore/v1"
+	"google.golang.org/grpc/status"
 )
 
 const (
@@ -36,6 +36,7 @@ const (
 	projectID       = "go-cloud-test-216917"
 	collectionName1 = "docstore-test-1"
 	collectionName2 = "docstore-test-2"
+	collectionName3 = "docstore-test-3"
 	endPoint        = "firestore.googleapis.com:443"
 )
 
@@ -55,13 +56,13 @@ func newHarness(ctx context.Context, t *testing.T) (drivertest.Harness, error) {
 }
 
 func (h *harness) MakeCollection(context.Context) (driver.Collection, error) {
-	return newCollection(h.client, projectID, collectionName1, drivertest.KeyField, nil)
+	return newCollection(h.client, projectID, collectionName1, drivertest.KeyField, nil, nil)
 }
 
 func (h *harness) MakeTwoKeyCollection(context.Context) (driver.Collection, error) {
 	return newCollection(h.client, projectID, collectionName2, "", func(doc docstore.Document) string {
 		return drivertest.HighScoreKey(doc).(string)
-	})
+	}, &Options{AllowLocalFilters: true})
 }
 
 func (h *harness) Close() {
@@ -75,7 +76,7 @@ type codecTester struct {
 }
 
 func (*codecTester) UnsupportedTypes() []drivertest.UnsupportedType {
-	return []drivertest.UnsupportedType{drivertest.Uint, drivertest.Complex, drivertest.Arrays}
+	return []drivertest.UnsupportedType{drivertest.Uint, drivertest.Arrays}
 }
 
 func (c *codecTester) NativeEncode(x interface{}) (interface{}, error) {
@@ -115,6 +116,15 @@ func (verifyAs) CollectionCheck(coll *docstore.Collection) error {
 	return nil
 }
 
+func (verifyAs) BeforeDo(as func(i interface{}) bool) error {
+	var get *pb.BatchGetDocumentsRequest
+	var write *pb.CommitRequest
+	if !as(&get) && !as(&write) {
+		return errors.New("ActionList.BeforeDo failed")
+	}
+	return nil
+}
+
 func (verifyAs) BeforeQuery(as func(i interface{}) bool) error {
 	var req *pb.RunQueryRequest
 	if !as(&req) {
@@ -133,13 +143,35 @@ func (verifyAs) QueryCheck(it *docstore.DocumentIterator) error {
 	return err
 }
 
+func (v verifyAs) ErrorCheck(c *docstore.Collection, err error) error {
+	var s *status.Status
+	if !c.ErrorAs(err, &s) {
+		return errors.New("Collection.ErrorAs failed")
+	}
+	return nil
+}
+
 func TestConformance(t *testing.T) {
 	drivertest.MakeUniqueStringDeterministicForTesting(1)
+	maxWritesPerRPC = 2 // to test RPC batching behavior
 	nc, err := newNativeCodec()
 	if err != nil {
 		t.Fatal(err)
 	}
-	drivertest.RunConformanceTests(t, newHarness, &codecTester{nc}, nil)
+	drivertest.RunConformanceTests(t, newHarness, &codecTester{nc}, []drivertest.AsTest{verifyAs{}})
+}
+
+func BenchmarkConformance(b *testing.B) {
+	ctx := context.Background()
+	client, err := vkit.NewClient(ctx)
+	if err != nil {
+		b.Fatal(err)
+	}
+	coll, err := newCollection(client, projectID, collectionName3, drivertest.KeyField, nil, nil)
+	if err != nil {
+		b.Fatal(err)
+	}
+	drivertest.RunBenchmarks(b, docstore.NewCollection(coll))
 }
 
 // Firedocstore-specific tests.
@@ -206,8 +238,8 @@ func TestOpenCollection(t *testing.T) {
 func TestNewGetRequest(t *testing.T) {
 	c := &collection{dbPath: "dbPath", collPath: "collPath", nameField: "name"}
 	actions := []*driver.Action{
-		{Kind: driver.Get, Doc: drivertest.MustDocument(map[string]interface{}{"name": "a"})},
-		{Kind: driver.Get, Doc: drivertest.MustDocument(map[string]interface{}{"name": "b"})},
+		{Kind: driver.Get, Key: "a", Doc: drivertest.MustDocument(map[string]interface{}{"name": "a"})},
+		{Kind: driver.Get, Key: "b", Doc: drivertest.MustDocument(map[string]interface{}{"name": "b"})},
 	}
 	got, err := c.newGetRequest(actions)
 	if err != nil {
@@ -219,16 +251,5 @@ func TestNewGetRequest(t *testing.T) {
 	}
 	if !proto.Equal(got, want) {
 		t.Errorf("\ngot  %v\nwant %v", got, want)
-	}
-
-	// Duplicate names should return an error.
-	actions = []*driver.Action{
-		{Kind: driver.Get, Doc: drivertest.MustDocument(map[string]interface{}{"name": "a"})},
-		{Kind: driver.Get, Doc: drivertest.MustDocument(map[string]interface{}{"name": "b"})},
-		{Kind: driver.Get, Doc: drivertest.MustDocument(map[string]interface{}{"name": "a"})},
-	}
-	_, err = c.newGetRequest(actions)
-	if gcerrors.Code(err) != gcerrors.InvalidArgument {
-		t.Errorf("got %v, want InvalidArgument", err)
 	}
 }

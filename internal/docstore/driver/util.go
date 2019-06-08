@@ -15,6 +15,9 @@
 package driver
 
 import (
+	"reflect"
+	"sort"
+
 	"github.com/google/uuid"
 )
 
@@ -47,4 +50,119 @@ func SplitActions(actions []*Action, split func(a, b *Action) bool) [][]*Action 
 	}
 	collect()
 	return groups
+}
+
+// GroupActions separates actions into four sets: writes, gets that must happen before the writes,
+// gets that must happen after the writes, and gets that can happen concurrently with the writes.
+func GroupActions(actions []*Action) (beforeGets, getList, writeList, afterGets []*Action) {
+	// maps from key to action
+	bgets := map[interface{}]*Action{}
+	agets := map[interface{}]*Action{}
+	cgets := map[interface{}]*Action{}
+	writes := map[interface{}]*Action{}
+	for _, a := range actions {
+		if a.Kind == Get {
+			// If there was a prior write with this key, make sure this get
+			// happens after the writes.
+			if _, ok := writes[a.Key]; ok {
+				agets[a.Key] = a
+			} else {
+				cgets[a.Key] = a
+			}
+		} else {
+			// This is a write. A prior get on the same key was put into cgets; move
+			// it to bgets because it has to happen before writes.
+			if g, ok := cgets[a.Key]; ok {
+				delete(cgets, a.Key)
+				bgets[a.Key] = g
+			}
+			writes[a.Key] = a
+		}
+	}
+
+	vals := func(m map[interface{}]*Action) []*Action {
+		var as []*Action
+		for _, v := range m {
+			as = append(as, v)
+		}
+		// Sort so the order is always the same for replay.
+		sort.Slice(as, func(i, j int) bool { return as[i].Index < as[j].Index })
+		return as
+	}
+
+	return vals(bgets), vals(cgets), vals(writes), vals(agets)
+}
+
+// AsFunc creates and returns an "as function" that behaves as follows:
+// If its argument is a pointer to the same type as val, the argument is set to val
+// and the function returns true. Otherwise, the function returns false.
+func AsFunc(val interface{}) func(interface{}) bool {
+	rval := reflect.ValueOf(val)
+	wantType := reflect.PtrTo(rval.Type())
+	return func(i interface{}) bool {
+		if i == nil {
+			return false
+		}
+		ri := reflect.ValueOf(i)
+		if ri.Type() != wantType {
+			return false
+		}
+		ri.Elem().Set(rval)
+		return true
+	}
+}
+
+// GroupByFieldPath collect the Get actions into groups with the same set of
+// field paths.
+func GroupByFieldPath(gets []*Action) [][]*Action {
+	// This is quadratic in the worst case, but it's unlikely that there would be
+	// many Gets with different field paths.
+	var groups [][]*Action
+	seen := map[*Action]bool{}
+	for len(seen) < len(gets) {
+		var g []*Action
+		for _, a := range gets {
+			if !seen[a] {
+				if len(g) == 0 || fpsEqual(g[0].FieldPaths, a.FieldPaths) {
+					g = append(g, a)
+					seen[a] = true
+				}
+			}
+		}
+		groups = append(groups, g)
+	}
+	return groups
+}
+
+// Report whether two lists of field paths are equal.
+func fpsEqual(fps1, fps2 [][]string) bool {
+	// TODO?: We really care about sets of field paths, but that's too tedious to determine.
+	if len(fps1) != len(fps2) {
+		return false
+	}
+	for i, fp1 := range fps1 {
+		if !FieldPathsEqual(fp1, fps2[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+// FieldPathsEqual reports whether two field paths are equal.
+func FieldPathsEqual(fp1, fp2 []string) bool {
+	if len(fp1) != len(fp2) {
+		return false
+	}
+	for i, s1 := range fp1 {
+		if s1 != fp2[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// FieldPathEqualsField reports whether a field path equals a field.
+// This is a convenience for FieldPathsEqual(fp, []string{s}).
+func FieldPathEqualsField(fp []string, s string) bool {
+	return len(fp) == 1 && fp[0] == s
 }

@@ -19,10 +19,10 @@
 // key values need not be strings; they may be any comparable Go value.
 //
 //
-// Unordered Action Lists
+// Action Lists
 //
-// Unordered action lists are executed concurrently. Each action in an unordered
-// action list is executed in a separate goroutine.
+// Action lists are executed concurrently. Each action in an action list is executed
+// in a separate goroutine.
 //
 //
 // URLs
@@ -31,7 +31,7 @@
 // "mem".
 // To customize the URL opener, or for more details on the URL format,
 // see URLOpener.
-// See https://godoc.org/gocloud.dev#hdr-URLs for background information.
+// See https://gocloud.dev/concepts/urls/ for background information.
 package memdocstore // import "gocloud.dev/internal/docstore/memdocstore"
 
 import (
@@ -73,14 +73,18 @@ func (*URLOpener) OpenCollectionURL(ctx context.Context, u *url.URL) (*docstore.
 }
 
 // Options are optional arguments to the OpenCollection functions.
-type Options struct{}
+type Options struct {
+	// The name of the field holding the document revision.
+	// Defaults to docstore.RevisionField.
+	RevisionField string
+}
 
 // TODO(jba): make this package thread-safe.
 
 // OpenCollection creates a *docstore.Collection backed by memory. keyField is the
 // document field holding the primary key of the collection.
-func OpenCollection(keyField string, _ *Options) (*docstore.Collection, error) {
-	c, err := newCollection(keyField, nil)
+func OpenCollection(keyField string, opts *Options) (*docstore.Collection, error) {
+	c, err := newCollection(keyField, nil, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -91,35 +95,59 @@ func OpenCollection(keyField string, _ *Options) (*docstore.Collection, error) {
 // a document and returns the document's primary key. It should return nil if the
 // document is missing the information to construct a key. This will cause all
 // actions, even Create, to fail.
-func OpenCollectionWithKeyFunc(keyFunc func(docstore.Document) interface{}, _ *Options) (*docstore.Collection, error) {
-	c, err := newCollection("", keyFunc)
+func OpenCollectionWithKeyFunc(keyFunc func(docstore.Document) interface{}, opts *Options) (*docstore.Collection, error) {
+	c, err := newCollection("", keyFunc, opts)
 	if err != nil {
 		return nil, err
 	}
 	return docstore.NewCollection(c), nil
 }
 
-func newCollection(keyField string, keyFunc func(docstore.Document) interface{}) (driver.Collection, error) {
+func newCollection(keyField string, keyFunc func(docstore.Document) interface{}, opts *Options) (driver.Collection, error) {
 	if keyField == "" && keyFunc == nil {
 		return nil, gcerr.Newf(gcerr.InvalidArgument, nil, "must provide either keyField or keyFunc")
 	}
+	if opts == nil {
+		opts = &Options{}
+	}
+	if opts.RevisionField == "" {
+		opts.RevisionField = docstore.RevisionField
+	}
 	return &collection{
-		keyField:     keyField,
-		keyFunc:      keyFunc,
-		docs:         map[interface{}]map[string]interface{}{},
-		nextRevision: 1,
+		keyField:    keyField,
+		keyFunc:     keyFunc,
+		opts:        opts,
+		docs:        map[interface{}]map[string]interface{}{},
+		curRevision: 0,
 	}, nil
 }
 
 type collection struct {
 	keyField string
 	keyFunc  func(docstore.Document) interface{}
+	opts     *Options
 	mu       sync.Mutex
 	// map from keys to documents. Documents are represented as map[string]interface{},
 	// regardless of what their original representation is. Even if the user is using
 	// map[string]interface{}, we make our own copy.
-	docs         map[interface{}]map[string]interface{}
-	nextRevision int64 // incremented on each write
+	docs        map[interface{}]map[string]interface{}
+	curRevision int64 // incremented on each write
+}
+
+func (c *collection) Key(doc driver.Document) (interface{}, error) {
+	if c.keyField != "" {
+		key, _ := doc.GetField(c.keyField) // no error on missing key, and it will be nil
+		return key, nil
+	}
+	key := c.keyFunc(doc.Origin)
+	if key == nil {
+		return nil, gcerr.Newf(gcerr.InvalidArgument, nil, "missing document key")
+	}
+	return key, nil
+}
+
+func (c *collection) RevisionField() string {
+	return c.opts.RevisionField
 }
 
 // ErrorCode implements driver.ErrorCode.
@@ -129,28 +157,28 @@ func (c *collection) ErrorCode(err error) gcerr.ErrorCode {
 
 // RunActions implements driver.RunActions.
 func (c *collection) RunActions(ctx context.Context, actions []*driver.Action, opts *driver.RunActionsOptions) driver.ActionListError {
-	if opts.Unordered {
-		errs := make([]error, len(actions))
+	errs := make([]error, len(actions))
+
+	// Run the actions concurrently with each other.
+	run := func(as []*driver.Action) {
 		var wg sync.WaitGroup
-		for i, a := range actions {
-			i := i
+		for _, a := range as {
 			a := a
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				errs[i] = c.runAction(ctx, a)
+				errs[a.Index] = c.runAction(ctx, a)
 			}()
 		}
 		wg.Wait()
-		return driver.NewActionListError(errs)
 	}
-	// Run each action in order, stopping at the first error.
-	for i, a := range actions {
-		if err := c.runAction(ctx, a); err != nil {
-			return driver.ActionListError{{i, err}}
-		}
-	}
-	return nil
+
+	beforeGets, gets, writes, afterGets := driver.GroupActions(actions)
+	run(beforeGets)
+	run(gets)
+	run(writes)
+	run(afterGets)
+	return driver.NewActionListError(errs)
 }
 
 // runAction executes a single action.
@@ -160,10 +188,6 @@ func (c *collection) runAction(ctx context.Context, a *driver.Action) error {
 		return ctx.Err()
 	}
 	// Get the key from the doc so we can look it up in the map.
-	key := c.key(a.Doc)
-	if key == nil && (a.Kind != driver.Create || c.keyField == "") {
-		return gcerr.Newf(gcerr.InvalidArgument, nil, "missing key field")
-	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	// If there is a key, get the current document with that key.
@@ -171,31 +195,31 @@ func (c *collection) runAction(ctx context.Context, a *driver.Action) error {
 		current map[string]interface{}
 		exists  bool
 	)
-	if key != nil {
-		current, exists = c.docs[key]
+	if a.Key != nil {
+		current, exists = c.docs[a.Key]
 	}
 	// Check for a NotFound error.
 	if !exists && (a.Kind == driver.Replace || a.Kind == driver.Update || a.Kind == driver.Get) {
-		return gcerr.Newf(gcerr.NotFound, nil, "document with key %v does not exist", key)
+		return gcerr.Newf(gcerr.NotFound, nil, "document with key %v does not exist", a.Key)
 	}
 	switch a.Kind {
 	case driver.Create:
 		// It is an error to attempt to create an existing document.
 		if exists {
-			return gcerr.Newf(gcerr.AlreadyExists, nil, "Create: document with key %v exists", key)
+			return gcerr.Newf(gcerr.AlreadyExists, nil, "Create: document with key %v exists", a.Key)
 		}
 		// If the user didn't supply a value for the key field, create a new one.
-		if key == nil && c.keyField != "" {
-			key = driver.UniqueString()
+		if a.Key == nil {
+			a.Key = driver.UniqueString()
 			// Set the new key in the document.
-			if err := a.Doc.SetField(c.keyField, key); err != nil {
+			if err := a.Doc.SetField(c.keyField, a.Key); err != nil {
 				return gcerr.Newf(gcerr.InvalidArgument, nil, "cannot set key field %q", c.keyField)
 			}
 		}
 		fallthrough
 
 	case driver.Replace, driver.Put:
-		if err := checkRevision(a.Doc, current); err != nil {
+		if err := c.checkRevision(a.Doc, current); err != nil {
 			return err
 		}
 		doc, err := encodeDoc(a.Doc)
@@ -203,26 +227,29 @@ func (c *collection) runAction(ctx context.Context, a *driver.Action) error {
 			return err
 		}
 		c.changeRevision(doc)
-		c.docs[key] = doc
+		// Ignore errors. It's fine if the doc doesn't have a revision field.
+		a.Doc.SetField(c.opts.RevisionField, doc[c.opts.RevisionField])
+		c.docs[a.Key] = doc
 
 	case driver.Delete:
-		if err := checkRevision(a.Doc, current); err != nil {
+		if err := c.checkRevision(a.Doc, current); err != nil {
 			return err
 		}
-		delete(c.docs, key)
+		delete(c.docs, a.Key)
 
 	case driver.Update:
-		if err := checkRevision(a.Doc, current); err != nil {
+		if err := c.checkRevision(a.Doc, current); err != nil {
 			return err
 		}
 		if err := c.update(current, a.Mods); err != nil {
 			return err
 		}
+		_ = a.Doc.SetField(c.opts.RevisionField, current[c.opts.RevisionField])
 
 	case driver.Get:
 		// We've already retrieved the document into current, above.
 		// Now we copy its fields into the user-provided document.
-		if err := decodeDoc(current, a.Doc, a.FieldPaths); err != nil {
+		if err := decodeDoc(current, a.Doc, a.FieldPaths, c.opts.RevisionField); err != nil {
 			return err
 		}
 	default:
@@ -233,58 +260,105 @@ func (c *collection) runAction(ctx context.Context, a *driver.Action) error {
 
 // Must be called with the lock held.
 func (c *collection) update(doc map[string]interface{}, mods []driver.Mod) error {
-	// Apply each modification. Fail if any mod would fail.
 	// Sort mods by first field path element so tests are deterministic.
 	sort.Slice(mods, func(i, j int) bool { return mods[i].FieldPath[0] < mods[j].FieldPath[0] })
 
-	// Check first that every field path is valid. That is, whether every component
-	// of the path but the last refers to a map, and no component along the way is
-	// nil. If that check succeeds, all actions will succeed, making update atomic.
-	for _, m := range mods {
-		if _, err := getParentMap(doc, m.FieldPath, false); err != nil {
+	// To make update atomic, we first convert the actions into a form that can't
+	// fail.
+	type guaranteedMod struct {
+		parentMap    map[string]interface{} // the map holding the key to be modified
+		key          string
+		encodedValue interface{} // the value after encoding
+	}
+
+	gmods := make([]guaranteedMod, len(mods))
+	var err error
+	for i, mod := range mods {
+		gmod := &gmods[i]
+		// Check that the field path is valid. That is, every component of the path
+		// but the last refers to a map, and no component along the way is nil.
+		if gmod.parentMap, err = getParentMap(doc, mod.FieldPath, false); err != nil {
 			return err
 		}
-	}
-	for _, m := range mods {
-		if m.Value == nil {
-			deleteAtFieldPath(doc, m.FieldPath)
-		} else {
-			// This can't fail because we checked it above.
-			_ = setAtFieldPath(doc, m.FieldPath, m.Value)
+		gmod.key = mod.FieldPath[len(mod.FieldPath)-1]
+		if inc, ok := mod.Value.(driver.IncOp); ok {
+			amt, err := encodeValue(inc.Amount)
+			if err != nil {
+				return err
+			}
+			if gmod.encodedValue, err = add(gmod.parentMap[gmod.key], amt); err != nil {
+				return err
+			}
+		} else if mod.Value != nil {
+			// Make sure the value encodes successfully.
+			if gmod.encodedValue, err = encodeValue(mod.Value); err != nil {
+				return err
+			}
 		}
 	}
-	if len(mods) > 0 {
-		c.changeRevision(doc)
+	// Now execute the guaranteed mods.
+	for _, m := range gmods {
+		if m.encodedValue == nil {
+			delete(m.parentMap, m.key)
+		} else {
+			m.parentMap[m.key] = m.encodedValue
+		}
 	}
+	c.changeRevision(doc)
 	return nil
 }
 
-func (c *collection) key(doc driver.Document) interface{} {
-	if c.keyField != "" {
-		key, _ := doc.GetField(c.keyField) // ignore error because key will be nil
-		return key
+// Add two encoded numbers.
+// Since they're encoded, they are either int64 or float64.
+// Allow adding a float to an int, producing a float.
+// TODO(jba): see how other providers handle that.
+func add(x, y interface{}) (interface{}, error) {
+	if x == nil {
+		return y, nil
 	}
-	return c.keyFunc(doc.Origin)
+	switch x := x.(type) {
+	case int64:
+		switch y := y.(type) {
+		case int64:
+			return x + y, nil
+		case float64:
+			return float64(x) + y, nil
+		default:
+			// This shouldn't happen because it should be checked by docstore.
+			panic("bad increment amount")
+		}
+	case float64:
+		switch y := y.(type) {
+		case int64:
+			return x + float64(y), nil
+		case float64:
+			return x + y, nil
+		default:
+			panic("bad increment amount")
+		}
+	default:
+		return nil, gcerr.Newf(gcerr.InvalidArgument, nil, "value %v being incremented not int64 or float64", x)
+	}
 }
 
 // Must be called with the lock held.
 func (c *collection) changeRevision(doc map[string]interface{}) {
-	c.nextRevision++
-	doc[docstore.RevisionField] = c.nextRevision
+	c.curRevision++
+	doc[c.opts.RevisionField] = c.curRevision
 }
 
-func checkRevision(arg driver.Document, current map[string]interface{}) error {
+func (c *collection) checkRevision(arg driver.Document, current map[string]interface{}) error {
 	if current == nil {
 		return nil // no existing document
 	}
-	curRev := current[docstore.RevisionField].(int64)
-	r, err := arg.GetField(docstore.RevisionField)
+	curRev := current[c.opts.RevisionField].(int64)
+	r, err := arg.GetField(c.opts.RevisionField)
 	if err != nil || r == nil {
 		return nil // no incoming revision information: nothing to check
 	}
 	wantRev, ok := r.(int64)
 	if !ok {
-		return gcerr.Newf(gcerr.InvalidArgument, nil, "revision field %s is not an int64", docstore.RevisionField)
+		return gcerr.Newf(gcerr.InvalidArgument, nil, "revision field %s is not an int64", c.opts.RevisionField)
 	}
 	if wantRev != curRev {
 		return gcerr.Newf(gcerr.FailedPrecondition, nil, "mismatched revisions: want %d, current %d", wantRev, curRev)
@@ -345,3 +419,6 @@ func getParentMap(m map[string]interface{}, fp []string, create bool) (map[strin
 
 // As implements driver.As.
 func (c *collection) As(i interface{}) bool { return false }
+
+// As implements driver.Collection.ErrorAs.
+func (c *collection) ErrorAs(err error, i interface{}) bool { return false }

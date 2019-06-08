@@ -31,11 +31,11 @@ func newHarness(ctx context.Context, t *testing.T) (drivertest.Harness, error) {
 }
 
 func (h *harness) MakeCollection(context.Context) (driver.Collection, error) {
-	return newCollection(drivertest.KeyField, nil)
+	return newCollection(drivertest.KeyField, nil, nil)
 }
 
 func (h *harness) MakeTwoKeyCollection(context.Context) (driver.Collection, error) {
-	return newCollection("", drivertest.HighScoreKey)
+	return newCollection("", drivertest.HighScoreKey, nil)
 }
 
 func (h *harness) Close() {}
@@ -47,10 +47,40 @@ func TestConformance(t *testing.T) {
 
 type docmap = map[string]interface{}
 
+func TestUpdateEncodesValues(t *testing.T) {
+	// Check that update encodes the values in mods.
+	ctx := context.Background()
+	dc, err := newCollection(drivertest.KeyField, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	coll := docstore.NewCollection(dc)
+	doc := docmap{drivertest.KeyField: "testUpdateEncodes", "a": 1}
+	if err := coll.Put(ctx, doc); err != nil {
+		t.Fatal(err)
+	}
+	if err := coll.Update(ctx, doc, docstore.Mods{"a": 2}); err != nil {
+		t.Fatal(err)
+	}
+	got := docmap{drivertest.KeyField: doc[drivertest.KeyField]}
+	// This Get will fail if the int value 2 in the above mod was not encoded to an int64.
+	if err := coll.Get(ctx, got); err != nil {
+		t.Fatal(err)
+	}
+	want := docmap{
+		drivertest.KeyField:    doc[drivertest.KeyField],
+		"a":                    int64(2),
+		docstore.RevisionField: got[docstore.RevisionField],
+	}
+	if !cmp.Equal(got, want) {
+		t.Errorf("got %v, want %v", got, want)
+	}
+}
+
 func TestUpdateAtomic(t *testing.T) {
 	// Check that update is atomic.
 	ctx := context.Background()
-	dc, err := newCollection(drivertest.KeyField, nil)
+	dc, err := newCollection(drivertest.KeyField, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -58,7 +88,10 @@ func TestUpdateAtomic(t *testing.T) {
 	doc := docmap{drivertest.KeyField: "testUpdateAtomic", "a": "A", "b": "B"}
 
 	mods := docstore.Mods{"a": "Y", "b.c": "Z"} // "b" is not a map, so "b.c" is an error
-	if errs := coll.Actions().Put(doc).Update(doc, mods).Do(ctx); errs == nil {
+	if err := coll.Put(ctx, doc); err != nil {
+		t.Fatal(err)
+	}
+	if errs := coll.Actions().Update(doc, mods).Do(ctx); errs == nil {
 		t.Fatal("got nil, want errors")
 	}
 	got := docmap{drivertest.KeyField: doc[drivertest.KeyField]}
@@ -97,7 +130,7 @@ func TestOpenCollectionFromURL(t *testing.T) {
 }
 
 func TestMissingKeyCreateFailsWithKeyFunc(t *testing.T) {
-	dc, err := newCollection("", func(docstore.Document) interface{} { return nil })
+	dc, err := newCollection("", func(docstore.Document) interface{} { return nil }, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -105,5 +138,60 @@ func TestMissingKeyCreateFailsWithKeyFunc(t *testing.T) {
 	err = c.Create(context.Background(), map[string]interface{}{})
 	if err == nil {
 		t.Error("got nil, want error")
+	}
+}
+
+func TestSortDocs(t *testing.T) {
+	newDocs := func() []docmap {
+		return []docmap{
+			{"a": int64(1), "b": "1", "c": 3.0},
+			{"a": int64(2), "b": "2", "c": 4.0},
+			{"a": int64(3), "b": "3"}, // missing "c"
+		}
+	}
+	inorder := newDocs()
+	reversed := newDocs()
+	for i := 0; i < len(reversed)/2; i++ {
+		j := len(reversed) - i - 1
+		reversed[i], reversed[j] = reversed[j], reversed[i]
+	}
+
+	for _, test := range []struct {
+		field     string
+		ascending bool
+		want      []docmap
+	}{
+		{"a", true, inorder},
+		{"a", false, reversed},
+		{"b", true, inorder},
+		{"b", false, reversed},
+		{"c", true, inorder},
+		{"c", false, []docmap{inorder[1], inorder[0], inorder[2]}},
+	} {
+		got := newDocs()
+		sortDocs(got, test.field, test.ascending)
+		if diff := cmp.Diff(got, test.want); diff != "" {
+			t.Errorf("%q, asc=%t:\n%s", test.field, test.ascending, diff)
+		}
+	}
+}
+
+func TestAlternativeRevisionField(t *testing.T) {
+	coll, err := OpenCollection("Key", &Options{RevisionField: "Etag"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	type S struct {
+		Key  int
+		Etag interface{}
+	}
+
+	got := S{Key: 1}
+	if err := coll.Actions().Put(&S{Key: 1}).Get(&got).Do(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got.Etag != int64(1) {
+		t.Errorf("got %v, want 1", got.Etag)
 	}
 }

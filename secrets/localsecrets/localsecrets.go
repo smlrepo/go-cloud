@@ -21,7 +21,7 @@
 // For secrets.OpenKeeper, localsecrets registers for the scheme "base64key".
 // To customize the URL opener, or for more details on the URL format,
 // see URLOpener.
-// See https://godoc.org/gocloud.dev#hdr-URLs for background information.
+// See https://gocloud.dev/concepts/urls/ for background information.
 //
 // As
 //
@@ -136,9 +136,12 @@ func (k *keeper) Encrypt(ctx context.Context, message []byte) ([]byte, error) {
 	return secretbox.Seal(nonce[:], message, &nonce, &k.secretKey), nil
 }
 
-// Decrypt decryptes a message using a nonce that is read out of the first nonceSize bytes
+// Decrypt decrypts a message using a nonce that is read out of the first nonceSize bytes
 // of the message and a secret held in the Keeper.
 func (k *keeper) Decrypt(ctx context.Context, message []byte) ([]byte, error) {
+	if len(message) < nonceSize {
+		return nil, fmt.Errorf("localsecrets: invalid message length (%d, expected at least %d)", len(message), nonceSize)
+	}
 	var decryptNonce [nonceSize]byte
 	copy(decryptNonce[:], message[:nonceSize])
 

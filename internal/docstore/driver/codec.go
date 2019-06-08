@@ -53,7 +53,6 @@ type Encoder interface {
 	EncodeInt(int64)
 	EncodeUint(uint64)
 	EncodeFloat(float64)
-	EncodeComplex(complex128)
 	EncodeBytes([]byte)
 
 	// EncodeList is called when a slice or array is encountered (except for a
@@ -162,8 +161,6 @@ func encode(v reflect.Value, enc Encoder) error {
 		enc.EncodeUint(v.Uint())
 	case reflect.Float32, reflect.Float64:
 		enc.EncodeFloat(v.Float())
-	case reflect.Complex64, reflect.Complex128:
-		enc.EncodeComplex(v.Complex())
 	case reflect.String:
 		enc.EncodeString(v.String())
 	case reflect.Slice:
@@ -204,8 +201,8 @@ func encode(v reflect.Value, enc Encoder) error {
 
 // Encode an array or non-nil slice.
 func encodeList(v reflect.Value, enc Encoder) error {
-	// Byte slices or byte arrays encode specially.
-	if v.Type().Elem().Kind() == reflect.Uint8 {
+	// Byte slices encode specially.
+	if v.Type().Kind() == reflect.Slice && v.Type().Elem().Kind() == reflect.Uint8 {
 		enc.EncodeBytes(v.Bytes())
 		return nil
 	}
@@ -270,15 +267,19 @@ func encodeStructWithFields(v reflect.Value, fields fields.List, e Encoder) erro
 	e2 := e.EncodeMap(len(fields))
 	for _, f := range fields {
 		fv, ok := fieldByIndex(v, f.Index)
-		if ok {
-			if err := encode(fv, e2); err != nil {
-				return err
-			}
-			e2.MapKey(f.Name)
+		if !ok {
+			// if !ok, then f is a field in an embedded pointer to struct, and that embedded pointer
+			// is nil in v. In other words, the field exists in the struct type, but not this particular
+			// struct value. So we just ignore it.
+			continue
 		}
-		// if !ok, then f is a field in an embedded pointer to struct, and that embedded pointer
-		// is nil in v. In other words, the field exists in the struct type, but not this particular
-		// struct value. So we just ignore it.
+		if f.ParsedTag.(tagOptions).omitEmpty && isEmptyValue(fv) {
+			continue
+		}
+		if err := encode(fv, e2); err != nil {
+			return err
+		}
+		e2.MapKey(f.Name)
 	}
 	return nil
 }
@@ -320,7 +321,6 @@ type Decoder interface {
 	AsInt() (int64, bool)
 	AsUint() (uint64, bool)
 	AsFloat() (float64, bool)
-	AsComplex() (complex128, bool)
 	AsBytes() ([]byte, bool)
 	AsBool() (bool, bool)
 	AsNull() bool
@@ -467,12 +467,6 @@ func decode(v reflect.Value, d Decoder) error {
 		}
 		v.SetUint(u)
 		return nil
-
-	case reflect.Complex64, reflect.Complex128:
-		if c, ok := d.AsComplex(); ok {
-			v.SetComplex(c)
-			return nil
-		}
 
 	case reflect.Slice, reflect.Array:
 		return decodeList(v, d)
@@ -704,7 +698,7 @@ func fieldByIndexCreate(v reflect.Value, index []int) (reflect.Value, bool) {
 }
 
 func decodingError(v reflect.Value, d Decoder) error {
-	return gcerr.Newf(gcerr.InvalidArgument, nil, "cannot set type %s to %s", v.Type(), d)
+	return gcerr.Newf(gcerr.InvalidArgument, nil, "cannot set type %s to %v", v.Type(), d)
 }
 
 func overflowError(x interface{}, t reflect.Type) error {
@@ -716,4 +710,50 @@ func wrap(err error, code gcerr.ErrorCode) error {
 		err = gcerr.New(code, err, 2, err.Error())
 	}
 	return err
+}
+
+var fieldCache = fields.NewCache(parseTag, nil, nil)
+
+// Copied from encoding/json, go 1.12.
+func isEmptyValue(v reflect.Value) bool {
+	switch v.Kind() {
+	case reflect.Array, reflect.Map, reflect.Slice, reflect.String:
+		return v.Len() == 0
+	case reflect.Bool:
+		return !v.Bool()
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return v.Int() == 0
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+		return v.Uint() == 0
+	case reflect.Float32, reflect.Float64:
+		return v.Float() == 0
+	case reflect.Interface, reflect.Ptr:
+		return v.IsNil()
+	}
+	return false
+}
+
+// Options for struct tags.
+type tagOptions struct {
+	omitEmpty bool // do not encode value if empty
+}
+
+// parseTag interprets docstore struct field tags.
+func parseTag(t reflect.StructTag) (name string, keep bool, other interface{}, err error) {
+	var opts []string
+	if _, ok := t.Lookup("docstore"); ok {
+		name, keep, opts = fields.ParseStandardTag("docstore", t)
+	} else {
+		name, keep, opts = fields.ParseStandardTag("json", t)
+	}
+	tagOpts := tagOptions{}
+	for _, opt := range opts {
+		switch opt {
+		case "omitempty":
+			tagOpts.omitEmpty = true
+		default:
+			return "", false, nil, gcerr.Newf(gcerr.InvalidArgument, nil, "unknown tag option: %q", opt)
+		}
+	}
+	return name, keep, tagOpts, nil
 }

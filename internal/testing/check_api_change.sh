@@ -17,64 +17,77 @@
 # current branch relative to the upstream branch.
 # It fails if it finds any, unless there is a commit with BREAKING_CHANGE_OK
 # in the first line of the commit message.
-
-# This script expects:
-# a) to be run at the root of the repository
-# b) HEAD is pointing to a commit that merges between the pull request and the
-#    upstream branch (TRAVIS_BRANCH). This is what Travis does (see
-#    https://docs.travis-ci.com/user/pull-requests/ for details), but if you
-#    are testing this script manually, you may need to manually create a merge
-#    commit.
+#
+# It checks all modules listed in allmodules, and skips packages with
+# "internal" or "test" in their name.
+#
+# It expects to be run at the root of the repository, and that HEAD is pointing
+# to a commit that merges between the pull request and the upstream branch
+# (TRAVIS_BRANCH). This is what Travis does (see
+# https://docs.travis-ci.com/user/pull-requests/ for details), but if you
+# are testing this script manually, you may need to manually create a merge
+# commit.
 
 set -euo pipefail
 
 UPSTREAM_BRANCH="${TRAVIS_BRANCH:-master}"
 echo "Checking for incompatible API changes relative to ${UPSTREAM_BRANCH}..."
-echo
 
-go install -mod=readonly golang.org/x/exp/cmd/apidiff
-
+INSTALL_DIR="$(mktemp -d)"
 MASTER_CLONE_DIR="$(mktemp -d)"
 PKGINFO_BRANCH=$(mktemp)
 PKGINFO_MASTER=$(mktemp)
 
 function cleanup() {
+  rm -rf "$INSTALL_DIR"
   rm -rf "$MASTER_CLONE_DIR"
   rm -f "$PKGINFO_BRANCH"
   rm -f "$PKGINFO_MASTER"
 }
 trap cleanup EXIT
 
-git clone -b "$UPSTREAM_BRANCH" . "$MASTER_CLONE_DIR"
-echo
+# Move to a temporary directory while installing apidiff to avoid changing
+# the local .mod file.
+( cd "$INSTALL_DIR" && exec go mod init unused )
+( cd "$INSTALL_DIR" && exec go install golang.org/x/exp/cmd/apidiff )
+
+git clone -b "$UPSTREAM_BRANCH" . "$MASTER_CLONE_DIR" &> /dev/null
 
 incompatible_change_pkgs=()
-PKGS=$(cd "$MASTER_CLONE_DIR"; go list ./... | grep -v internal | grep -v test | grep -v samples)
-for pkg in $PKGS; do
-  echo "Testing ${pkg}..."
+while read -r path || [[ -n "$path" ]]; do
+  echo "  checking packages in module $path"
+  pushd "$path" &> /dev/null
 
-  # Compute export data for the current branch.
-  package_deleted=0
-  apidiff -w "$PKGINFO_BRANCH" "$pkg" || package_deleted=1
-  if [[ $package_deleted -eq 1 ]]; then
-    echo "  Package ${pkg} was deleted! Recording as an incompatible change.";
-    incompatible_change_pkgs+=(${pkg});
-    continue;
-  fi
+  PKGS=$(cd "$MASTER_CLONE_DIR" && cd "$path" && go list ./...)
+  for pkg in $PKGS; do
+    if [[ "$pkg" =~ "test" ]] || [[ "$pkg" =~ "internal" ]] || [[ "$pkg" =~ "samples" ]]; then
+      continue
+    fi
+    echo "    checking ${pkg}..."
 
-  # Compute export data for master@HEAD.
-  (cd "$MASTER_CLONE_DIR"; apidiff -w "$PKGINFO_MASTER" "$pkg")
+    # Compute export data for the current branch.
+    package_deleted=0
+    apidiff -w "$PKGINFO_BRANCH" "$pkg" || package_deleted=1
+    if [[ $package_deleted -eq 1 ]]; then
+      echo "    package ${pkg} was deleted! Recording as an incompatible change.";
+      incompatible_change_pkgs+=(${pkg});
+      continue;
+    fi
 
-  # Print all changes for posterity.
-  apidiff "$PKGINFO_MASTER" "$PKGINFO_BRANCH"
+    # Compute export data for master@HEAD.
+    (cd "$MASTER_CLONE_DIR" && cd "$path" && apidiff -w "$PKGINFO_MASTER" "$pkg")
 
-  # Note if there's an incompatible change.
-  ic=$(apidiff -incompatible "$PKGINFO_MASTER" "$PKGINFO_BRANCH")
-  if [ ! -z "$ic" ]; then
-    incompatible_change_pkgs+=("$pkg");
-  fi
-done
-echo
+    # Print all changes for posterity.
+    apidiff "$PKGINFO_MASTER" "$PKGINFO_BRANCH"
+
+    # Note if there's an incompatible change.
+    ic=$(apidiff -incompatible "$PKGINFO_MASTER" "$PKGINFO_BRANCH")
+    if [ ! -z "$ic" ]; then
+      incompatible_change_pkgs+=("$pkg");
+    fi
+  done
+  popd &> /dev/null
+done < <( sed -e '/^#/d' -e '/^$/d' allmodules | awk '{print $1}' )
 
 if [ ${#incompatible_change_pkgs[@]} -eq 0 ]; then
   # No incompatible changes, we are good.

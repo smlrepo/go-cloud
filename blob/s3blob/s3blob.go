@@ -23,7 +23,7 @@
 // for more details.
 // To customize the URL opener, or for more details on the URL format,
 // see URLOpener.
-// See https://godoc.org/gocloud.dev#hdr-URLs for background information.
+// See https://gocloud.dev/concepts/urls/ for background information.
 //
 // Escaping
 //
@@ -70,7 +70,6 @@ import (
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/aws/client"
-	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/aws/aws-sdk-go/service/s3/s3manager"
 	"github.com/google/wire"
@@ -103,7 +102,7 @@ type lazySessionOpener struct {
 
 func (o *lazySessionOpener) OpenBucketURL(ctx context.Context, u *url.URL) (*blob.Bucket, error) {
 	o.init.Do(func() {
-		sess, err := session.NewSessionWithOptions(session.Options{SharedConfigState: session.SharedConfigEnable})
+		sess, err := gcaws.NewDefaultSession()
 		if err != nil {
 			o.err = err
 			return
@@ -276,9 +275,9 @@ func (w *writer) open(pr *io.PipeReader) error {
 	return nil
 }
 
-// Close completes the writer and close it. Any error occuring during write will
-// be returned. If a writer is closed before any Write is called, Close will
-// create an empty file at the given key.
+// Close completes the writer and closes it. Any error occurring during write
+// will be returned. If a writer is closed before any Write is called, Close
+// will create an empty file at the given key.
 func (w *writer) Close() error {
 	if w.w == nil {
 		// We never got any bytes written. We'll write an http.NoBody.

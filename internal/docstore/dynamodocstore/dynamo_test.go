@@ -17,12 +17,17 @@ package dynamodocstore
 import (
 	"context"
 	"errors"
+	"fmt"
+	"io"
 	"net/url"
+	"sort"
 	"testing"
 
 	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/aws/session"
 	dyn "github.com/aws/aws-sdk-go/service/dynamodb"
+	gcaws "gocloud.dev/aws"
 	"gocloud.dev/gcerrors"
 	"gocloud.dev/internal/docstore"
 	"gocloud.dev/internal/docstore/driver"
@@ -39,11 +44,18 @@ import (
 //   local index:  "Game" partition key, "Score" sort key
 //   global index: "Player" partition key, "Time" sort key
 // The conformance test queries should exercise all of these.
+//
+// The docstore-test-3 table is used for running benchmarks only. To eliminate
+// the effect of dynamo auto-scaling, run:
+// aws dynamodb update-table --table-name docstore-test-3 \
+//   --provisioned-throughput ReadCapacityUnits=1000,WriteCapacityUnits=1000
+// Don't forget to change it back when done benchmarking.
 
 const (
 	region          = "us-east-2"
 	collectionName1 = "docstore-test-1"
 	collectionName2 = "docstore-test-2"
+	collectionName3 = "docstore-test-3" // for benchmark
 )
 
 type harness struct {
@@ -62,12 +74,85 @@ func (h *harness) Close() {
 }
 
 func (h *harness) MakeCollection(context.Context) (driver.Collection, error) {
-	return newCollection(dyn.New(h.sess), collectionName1, drivertest.KeyField, "")
+	return newCollection(dyn.New(h.sess), collectionName1, drivertest.KeyField, "", &Options{AllowScans: true})
 }
 
 func (h *harness) MakeTwoKeyCollection(context.Context) (driver.Collection, error) {
-	return newCollection(dyn.New(h.sess), collectionName2, "Game", "Player")
+	return newCollection(dyn.New(h.sess), collectionName2, "Game", "Player", &Options{
+		AllowScans: true,
+		RunQueryFallback: func(ctx context.Context, q *driver.Query, run RunQueryFunc) (driver.DocumentIterator, error) {
+			// If the query failed because it needs to do a scan and there is an OrderBy clause,
+			// then do the scan and sort the results locally.
+			// This isn't always the recommended approach for production code, but it can
+			// work if the collection is small.
+			if q.OrderByField == "" {
+				return nil, errors.New("RunQueryFallback cannot handle query")
+			}
+			var less func(int, int) bool
+			var hs []*drivertest.HighScore
+			switch q.OrderByField {
+			case "Player":
+				if q.OrderAscending {
+					less = func(i, j int) bool { return hs[i].Player < hs[j].Player }
+				} else {
+					less = func(i, j int) bool { return hs[i].Player > hs[j].Player }
+				}
+			default:
+				return nil, fmt.Errorf("RunQueryFallback cannot handle OrderByField %q", q.OrderByField)
+			}
+			q.OrderByField = ""
+			iter, err := run(ctx, q)
+			if err != nil {
+				return nil, err
+			}
+			defer iter.Stop()
+			hs, err = collectHighScores(ctx, iter)
+			if err != nil {
+				return nil, err
+			}
+			sort.Slice(hs, less)
+			return &highScoreSliceIterator{hs, 0}, nil
+		},
+	})
 }
+
+func collectHighScores(ctx context.Context, iter driver.DocumentIterator) ([]*drivertest.HighScore, error) {
+	var hs []*drivertest.HighScore
+	for {
+		var h drivertest.HighScore
+		doc := drivertest.MustDocument(&h)
+		err := iter.Next(ctx, doc)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+		hs = append(hs, &h)
+	}
+	return hs, nil
+}
+
+type highScoreSliceIterator struct {
+	hs   []*drivertest.HighScore
+	next int
+}
+
+func (it *highScoreSliceIterator) Next(ctx context.Context, doc driver.Document) error {
+	if it.next >= len(it.hs) {
+		return io.EOF
+	}
+	dest, ok := doc.Origin.(*drivertest.HighScore)
+	if !ok {
+		return fmt.Errorf("doc is %T, not HighScore", doc.Origin)
+	}
+	*dest = *it.hs[it.next]
+	it.next++
+	return nil
+}
+
+func (*highScoreSliceIterator) Stop()               {}
+func (*highScoreSliceIterator) As(interface{}) bool { return false }
 
 type verifyAs struct{}
 
@@ -79,6 +164,15 @@ func (verifyAs) CollectionCheck(coll *docstore.Collection) error {
 	var db *dyn.DynamoDB
 	if !coll.As(&db) {
 		return errors.New("Collection.As failed")
+	}
+	return nil
+}
+
+func (verifyAs) BeforeDo(as func(i interface{}) bool) error {
+	var bg *dyn.BatchGetItemInput
+	var tw *dyn.TransactWriteItemsInput
+	if !as(&bg) && !as(&tw) {
+		return errors.New("ActionList.BeforeDo failed")
 	}
 	return nil
 }
@@ -106,8 +200,30 @@ func (verifyAs) QueryCheck(it *docstore.DocumentIterator) error {
 	return nil
 }
 
+func (v verifyAs) ErrorCheck(k *docstore.Collection, err error) error {
+	var e awserr.Error
+	if !k.ErrorAs(err, &e) {
+		return errors.New("Collection.ErrorAs failed")
+	}
+	return nil
+}
+
 func TestConformance(t *testing.T) {
+	// Note: when running -record repeatedly in a short time period, change the argument
+	// in the call below to generate unique transaction tokens.
+	drivertest.MakeUniqueStringDeterministicForTesting(1)
 	drivertest.RunConformanceTests(t, newHarness, &codecTester{}, []drivertest.AsTest{verifyAs{}})
+}
+
+func BenchmarkConformance(b *testing.B) {
+	sess := session.Must(session.NewSession(&aws.Config{
+		Region: aws.String(region),
+	}))
+	coll, err := newCollection(dyn.New(sess), collectionName3, drivertest.KeyField, "", &Options{AllowScans: true})
+	if err != nil {
+		b.Fatal(err)
+	}
+	drivertest.RunBenchmarks(b, docstore.NewCollection(coll))
 }
 
 // Dynamodocstore-specific tests.
@@ -148,6 +264,8 @@ func TestProcessURL(t *testing.T) {
 		{"dynamodb://docstore-test?partition_key=_kind&sort_key=_id", false},
 		// OK, overriding region.
 		{"dynamodb://docstore-test?partition_key=_kind&region=" + region, false},
+		// OK, allow_scans.
+		{"dynamodb://docstore-test?partition_key=_kind&allow_scans=true" + region, false},
 		// Unknown parameter.
 		{"dynamodb://docstore-test?partition_key=_kind&param=value", true},
 		// With path.
@@ -156,7 +274,7 @@ func TestProcessURL(t *testing.T) {
 		{"dynamodb://docstore-test?sort_key=_id", true},
 	}
 
-	sess, err := session.NewSessionWithOptions(session.Options{SharedConfigState: session.SharedConfigEnable})
+	sess, err := gcaws.NewDefaultSession()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -166,7 +284,7 @@ func TestProcessURL(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		_, _, _, _, err = o.processURL(u)
+		_, _, _, _, _, err = o.processURL(u)
 		if (err != nil) != test.WantErr {
 			t.Errorf("%s: got error %v, want error %v", test.URL, err, test.WantErr)
 		}

@@ -12,24 +12,25 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// TODO(jba): figure out how to get filters with complex values to work (since they
-// are represented as arrays of floats). Also, uints: since they are represented as
-// int64s, the sign is wrong. Since you can only compare complex numbers for
-// equality, maybe it could work if Firestore arrays can be compared for equality.
+// TODO(jba): figure out how to get filters with uints to work: since they are represented as
+// int64s, the sign is wrong.
 
 package firedocstore
 
 import (
 	"context"
 	"fmt"
+	"io"
 	"math"
 	"math/big"
 	"path"
 	"reflect"
 	"strings"
+	"time"
 
 	"github.com/golang/protobuf/ptypes/wrappers"
 	"gocloud.dev/internal/docstore/driver"
+	"gocloud.dev/internal/gcerr"
 	pb "google.golang.org/genproto/googleapis/firestore/v1"
 )
 
@@ -47,21 +48,14 @@ func (c *collection) newDocIterator(ctx context.Context, q *driver.Query) (*docI
 		QueryType: &pb.RunQueryRequest_StructuredQuery{sq},
 	}
 	if q.BeforeQuery != nil {
-		asFunc := func(i interface{}) bool {
-			p, ok := i.(**pb.RunQueryRequest)
-			if !ok {
-				return false
-			}
-			*p = req
-			return true
-		}
-		if err := q.BeforeQuery(asFunc); err != nil {
+		if err := q.BeforeQuery(driver.AsFunc(req)); err != nil {
 			return nil, err
 		}
 	}
 	ctx, cancel := context.WithCancel(ctx)
 	sc, err := c.client.RunQuery(ctx, req)
 	if err != nil {
+		cancel()
 		return nil, err
 	}
 	return &docIterator{
@@ -86,12 +80,18 @@ type docIterator struct {
 }
 
 func (it *docIterator) Next(ctx context.Context, doc driver.Document) error {
-	var res *pb.RunQueryResponse
-	var err error
+	res, err := it.nextResponse(ctx)
+	if err != nil {
+		return err
+	}
+	return decodeDoc(res.Document, doc, it.nameField)
+}
+
+func (it *docIterator) nextResponse(ctx context.Context) (*pb.RunQueryResponse, error) {
 	for {
-		res, err = it.streamClient.Recv()
+		res, err := it.streamClient.Recv()
 		if err != nil {
-			return err
+			return nil, err
 		}
 		// No document => partial progress; keep receiving.
 		if res.Document == nil {
@@ -99,13 +99,12 @@ func (it *docIterator) Next(ctx context.Context, doc driver.Document) error {
 		}
 		match, err := it.evaluateLocalFilters(res.Document)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		if match {
-			break
+			return res, nil
 		}
 	}
-	return decodeDoc(res.Document, doc, it.nameField)
 }
 
 // Report whether the filters are true of the document.
@@ -136,6 +135,14 @@ func evaluateFilter(f driver.Filter, doc driver.Document) bool {
 		// Treat a missing field as false.
 		return false
 	}
+	// Compare times.
+	if t1, ok := val.(time.Time); ok {
+		if t2, ok := f.Value.(time.Time); ok {
+			return applyComparison(f.Op, compareTimes(t1, t2))
+		} else {
+			return false
+		}
+	}
 	lhs := reflect.ValueOf(val)
 	rhs := reflect.ValueOf(f.Value)
 	if lhs.Kind() == reflect.String {
@@ -144,13 +151,13 @@ func evaluateFilter(f driver.Filter, doc driver.Document) bool {
 		}
 		return applyComparison(f.Op, strings.Compare(lhs.String(), rhs.String()))
 	}
+
 	// Compare numbers by using big.Float. This is expensive
 	// but simpler to code and more clearly correct. In particular,
 	// it will get the right answer for some mixed-type comparisons
 	// that are hard to do otherwise. For example, comparing the max int64
 	// with a float64: float64(math.MaxInt64) == float64(math.MaxInt64-1)
-	// is true in Go.
-	// TODO(jba): handle complex
+	// is true in Go, but the right answer is false.
 	lf := toBigFloat(lhs)
 	rf := toBigFloat(rhs)
 	// If either one is not a number, return false.
@@ -176,6 +183,17 @@ func applyComparison(op string, c int) bool {
 		return c <= 0
 	default:
 		panic("bad op")
+	}
+}
+
+func compareTimes(t1, t2 time.Time) int {
+	switch {
+	case t1.Before(t2):
+		return -1
+	case t1.After(t2):
+		return 1
+	default:
+		return 0
 	}
 }
 
@@ -223,12 +241,17 @@ func (c *collection) queryToProto(q *driver.Query) (*pb.StructuredQuery, []drive
 		p.Limit = &wrappers.Int32Value{Value: int32(q.Limit)}
 	}
 
+	// TODO(jba): make sure we retrieve the fields needed for local filters.
 	sendFilters, localFilters := splitFilters(q.Filters)
+	if len(localFilters) > 0 && !c.opts.AllowLocalFilters {
+		return nil, nil, gcerr.Newf(gcerr.InvalidArgument, nil, "query requires local filters; set Options.AllowLocalFilters to true to enable")
+	}
+
 	// If there is only one filter, use it directly. Otherwise, construct
 	// a CompositeFilter.
 	var pfs []*pb.StructuredQuery_Filter
 	for _, f := range sendFilters {
-		pf, err := filterToProto(f)
+		pf, err := c.filterToProto(f)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -244,7 +267,23 @@ func (c *collection) queryToProto(q *driver.Query) (*pb.StructuredQuery, []drive
 			}},
 		}
 	}
-	// TODO(jba): order
+
+	if q.OrderByField != "" {
+		// TODO(jba): reorder filters so order-by one is first of inequalities?
+		// TODO(jba): see if it's OK if filter inequality direction differs from sort direction.
+		fref := []string{q.OrderByField}
+		if q.OrderByField == c.nameField {
+			fref[0] = "__name__"
+		}
+		var dir pb.StructuredQuery_Direction
+		if q.OrderAscending {
+			dir = pb.StructuredQuery_ASCENDING
+		} else {
+			dir = pb.StructuredQuery_DESCENDING
+		}
+		p.OrderBy = []*pb.StructuredQuery_Order{{Field: fieldRef(fref), Direction: dir}}
+	}
+
 	// TODO(jba): cursors (start/end)
 	return p, localFilters, nil
 }
@@ -258,7 +297,7 @@ func splitFilters(fs []driver.Filter) (sendToFirestore, evaluateLocally []driver
 		if f.Op == driver.EqualOp {
 			sendToFirestore = append(sendToFirestore, f)
 		} else {
-			if rangeFP == nil || fpEqual(rangeFP, f.FieldPath) {
+			if rangeFP == nil || driver.FieldPathsEqual(rangeFP, f.FieldPath) {
 				// Multiple inequality filters on the same field are OK.
 				rangeFP = f.FieldPath
 				sendToFirestore = append(sendToFirestore, f)
@@ -270,7 +309,17 @@ func splitFilters(fs []driver.Filter) (sendToFirestore, evaluateLocally []driver
 	return sendToFirestore, evaluateLocally
 }
 
-func filterToProto(f driver.Filter) (*pb.StructuredQuery_Filter, error) {
+func (c *collection) filterToProto(f driver.Filter) (*pb.StructuredQuery_Filter, error) {
+	// Treat filters on the name field specially.
+	if c.nameField != "" && driver.FieldPathEqualsField(f.FieldPath, c.nameField) {
+		v := reflect.ValueOf(f.Value)
+		if v.Kind() != reflect.String {
+			return nil, gcerr.Newf(gcerr.InvalidArgument, nil,
+				"name field filter value %v of type %[1]T is not a string", f.Value)
+		}
+		return newFieldFilter([]string{"__name__"}, f.Op,
+			&pb.Value{ValueType: &pb.Value_ReferenceValue{c.collPath + "/" + v.String()}})
+	}
 	// "= nil" and "= NaN" are handled specially.
 	if uop, ok := unaryOpFor(f.Value); ok {
 		if f.Op != driver.EqualOp {
@@ -287,37 +336,11 @@ func filterToProto(f driver.Filter) (*pb.StructuredQuery_Filter, error) {
 			},
 		}, nil
 	}
-	var op pb.StructuredQuery_FieldFilter_Operator
-	switch f.Op {
-	case "<":
-		op = pb.StructuredQuery_FieldFilter_LESS_THAN
-	case "<=":
-		op = pb.StructuredQuery_FieldFilter_LESS_THAN_OR_EQUAL
-	case ">":
-		op = pb.StructuredQuery_FieldFilter_GREATER_THAN
-	case ">=":
-		op = pb.StructuredQuery_FieldFilter_GREATER_THAN_OR_EQUAL
-	case driver.EqualOp:
-		op = pb.StructuredQuery_FieldFilter_EQUAL
-	// TODO(jba): can we support array-contains portably?
-	// case "array-contains":
-	// 	op = pb.StructuredQuery_FieldFilter_ARRAY_CONTAINS
-	default:
-		return nil, fmt.Errorf("invalid operator %q", f.Op)
-	}
 	pv, err := encodeValue(f.Value)
 	if err != nil {
 		return nil, err
 	}
-	return &pb.StructuredQuery_Filter{
-		FilterType: &pb.StructuredQuery_Filter_FieldFilter{
-			FieldFilter: &pb.StructuredQuery_FieldFilter{
-				Field: fieldRef(f.FieldPath),
-				Op:    op,
-				Value: pv,
-			},
-		},
-	}, nil
+	return newFieldFilter(f.FieldPath, f.Op, pv)
 }
 
 func unaryOpFor(value interface{}) (pb.StructuredQuery_UnaryFilter_Operator, bool) {
@@ -346,6 +369,99 @@ func fieldRef(fp []string) *pb.StructuredQuery_FieldReference {
 	return &pb.StructuredQuery_FieldReference{FieldPath: toServiceFieldPath(fp)}
 }
 
+func newFieldFilter(fp []string, op string, val *pb.Value) (*pb.StructuredQuery_Filter, error) {
+	var fop pb.StructuredQuery_FieldFilter_Operator
+	switch op {
+	case "<":
+		fop = pb.StructuredQuery_FieldFilter_LESS_THAN
+	case "<=":
+		fop = pb.StructuredQuery_FieldFilter_LESS_THAN_OR_EQUAL
+	case ">":
+		fop = pb.StructuredQuery_FieldFilter_GREATER_THAN
+	case ">=":
+		fop = pb.StructuredQuery_FieldFilter_GREATER_THAN_OR_EQUAL
+	case driver.EqualOp:
+		fop = pb.StructuredQuery_FieldFilter_EQUAL
+	// TODO(jba): can we support array-contains portably?
+	// case "array-contains":
+	// 	fop = pb.StructuredQuery_FieldFilter_ARRAY_CONTAINS
+	default:
+		return nil, gcerr.Newf(gcerr.InvalidArgument, nil, "invalid operator: %q", op)
+	}
+	return &pb.StructuredQuery_Filter{
+		FilterType: &pb.StructuredQuery_Filter_FieldFilter{
+			FieldFilter: &pb.StructuredQuery_FieldFilter{
+				Field: fieldRef(fp),
+				Op:    fop,
+				Value: val,
+			},
+		},
+	}, nil
+}
+
 func (c *collection) QueryPlan(q *driver.Query) (string, error) {
 	return "unknown", nil
+}
+
+func (c *collection) RunDeleteQuery(ctx context.Context, q *driver.Query) error {
+	return c.runWriteQuery(ctx, q, func(doc *pb.Document) ([]*pb.Write, error) {
+		return []*pb.Write{{
+			Operation:       &pb.Write_Delete{Delete: doc.Name},
+			CurrentDocument: preconditionFromTimestamp(doc.UpdateTime),
+		}}, nil
+	})
+}
+
+func (c *collection) RunUpdateQuery(ctx context.Context, q *driver.Query, mods []driver.Mod) error {
+	fields, paths, transforms, err := processMods(mods)
+	if err != nil {
+		return err
+	}
+	return c.runWriteQuery(ctx, q, func(doc *pb.Document) ([]*pb.Write, error) {
+		return newUpdateWrites(doc.Name, doc.UpdateTime, fields, paths, transforms)
+	})
+}
+
+// For delete and update queries, limit the number of write actions per RPC, to bound
+// client memory.
+// This is a variable so it can be modified for tests.
+var maxWritesPerRPC = 500
+
+// runWriteQuery runs the query, calls writes for each returned document, and then commits those writes.
+func (c *collection) runWriteQuery(ctx context.Context, q *driver.Query, writes func(*pb.Document) ([]*pb.Write, error)) error {
+	q.FieldPaths = [][]string{{"__name__"}}
+	iter, err := c.newDocIterator(ctx, q)
+	if err != nil {
+		return err
+	}
+	defer iter.Stop()
+
+	opts := &driver.RunActionsOptions{}
+	var pws []*pb.Write
+	for {
+		res, err := iter.nextResponse(ctx)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return err
+		}
+		ws, err := writes(res.Document)
+		if err != nil {
+			return err
+		}
+		pws = append(pws, ws...)
+		if len(pws) >= maxWritesPerRPC {
+			_, err := c.commit(ctx, pws, opts)
+			if err != nil {
+				return err
+			}
+			pws = pws[:0]
+		}
+	}
+	if len(pws) > 0 {
+		_, err = c.commit(ctx, pws, opts)
+		return err
+	}
+	return nil
 }

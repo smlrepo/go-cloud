@@ -23,14 +23,14 @@ import (
 	"gocloud.dev/internal/docstore/dynamodocstore"
 )
 
-func Example() {
+func ExampleOpenCollection() {
 	ctx := context.Background()
 	sess, err := session.NewSession()
 	if err != nil {
 		fmt.Println(err)
 		return
 	}
-	coll, err := dynamodocstore.OpenCollection(dynamodb.New(sess), "docstore-test", "_id", "")
+	coll, err := dynamodocstore.OpenCollection(dynamodb.New(sess), "docstore-test", "_id", "", nil)
 	if err != nil {
 		fmt.Println(err)
 		return

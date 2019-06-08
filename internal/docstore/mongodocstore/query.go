@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"strings"
 
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
@@ -34,6 +35,20 @@ func (c *collection) RunGetQuery(ctx context.Context, q *driver.Query) (driver.D
 		lim := int64(q.Limit)
 		opts.Limit = &lim
 	}
+	if q.OrderByField != "" {
+		f := q.OrderByField
+		if c.opts.LowercaseFields {
+			f = strings.ToLower(f)
+		}
+		var dir int
+		if q.OrderAscending {
+			dir = 1
+		} else {
+			dir = -1
+		}
+		opts.Sort = bson.D{{Key: f, Value: dir}}
+	}
+
 	filter := bson.D{} // must be a zero-length slice, not nil
 	for _, f := range q.Filters {
 		bf, err := c.filterToBSON(f)
@@ -42,9 +57,22 @@ func (c *collection) RunGetQuery(ctx context.Context, q *driver.Query) (driver.D
 		}
 		filter = append(filter, bf)
 	}
+	if q.BeforeQuery != nil {
+		asFunc := func(i interface{}) bool {
+			p, ok := i.(**options.FindOptions)
+			if !ok {
+				return false
+			}
+			*p = opts
+			return true
+		}
+		if err := q.BeforeQuery(asFunc); err != nil {
+			return nil, err
+		}
+	}
 	cursor, err := c.coll.Find(ctx, filter, opts)
 	if err != nil {
-		return nil, fmt.Errorf("Find: %v", err)
+		return nil, err
 	}
 	return &docIterator{cursor: cursor, idField: c.idField, ctx: ctx}, nil
 }
@@ -55,6 +83,20 @@ var mongoQueryOps = map[string]string{
 	">=":           "$gte",
 	"<":            "$lt",
 	"<=":           "$lte",
+}
+
+// filtersToBSON converts a []driver.Filter to the MongoDB equivalent, expressed
+// as a bson.D (list of key-value pairs).
+func (c *collection) filtersToBSON(fs []driver.Filter) (bson.D, error) {
+	filter := bson.D{} // must be a zero-length slice, not nil
+	for _, f := range fs {
+		bf, err := c.filterToBSON(f)
+		if err != nil {
+			return nil, err
+		}
+		filter = append(filter, bf)
+	}
+	return filter, nil
 }
 
 // filterToBSON converts a driver.Filter to the MongoDB equivalent, expressed
@@ -85,17 +127,25 @@ type docIterator struct {
 }
 
 func (it *docIterator) Next(ctx context.Context, doc driver.Document) error {
+	m, err := it.nextMap(ctx)
+	if err != nil {
+		return err
+	}
+	return decodeDoc(m, doc, it.idField)
+}
+
+func (it *docIterator) nextMap(ctx context.Context) (map[string]interface{}, error) {
 	if !it.cursor.Next(ctx) {
 		if it.cursor.Err() != nil {
-			return it.cursor.Err()
+			return nil, it.cursor.Err()
 		}
-		return io.EOF
+		return nil, io.EOF
 	}
 	var m map[string]interface{}
 	if err := it.cursor.Decode(&m); err != nil {
-		return fmt.Errorf("cursor.Decode: %v", err)
+		return nil, fmt.Errorf("cursor.Decode: %v", err)
 	}
-	return decodeDoc(m, doc, it.idField)
+	return m, nil
 }
 
 func (it *docIterator) Stop() {
@@ -114,4 +164,26 @@ func (it *docIterator) As(i interface{}) bool {
 
 func (c *collection) QueryPlan(q *driver.Query) (string, error) {
 	return "unknown", nil
+}
+
+func (c *collection) RunDeleteQuery(ctx context.Context, q *driver.Query) error {
+	filter, err := c.filtersToBSON(q.Filters)
+	if err != nil {
+		return err
+	}
+	_, err = c.coll.DeleteMany(ctx, filter)
+	return err
+}
+
+func (c *collection) RunUpdateQuery(ctx context.Context, q *driver.Query, mods []driver.Mod) error {
+	filter, err := c.filtersToBSON(q.Filters)
+	if err != nil {
+		return err
+	}
+	updateDoc, _, err := c.newUpdateDoc(mods)
+	if err != nil {
+		return err
+	}
+	_, err = c.coll.UpdateMany(ctx, filter, updateDoc)
+	return err
 }

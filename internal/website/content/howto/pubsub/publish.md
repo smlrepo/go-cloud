@@ -17,10 +17,13 @@ like this:
 
 {{< goexample src="gocloud.dev/pubsub.ExampleTopic_Send" imports="0" >}}
 
+Note that the [semantics of message delivery][] can vary by provider.
+
 The rest of this guide will discuss how to accomplish the first step: opening
 a topic for your chosen Pub/Sub provider.
 
 [`*pubsub.Topic`]: https://godoc.org/gocloud.dev/pubsub#Topic
+[semantics of message delivery]: https://godoc.org/gocloud.dev/pubsub#hdr-At_most_once_and_At_least_once_Delivery
 
 ## Constructors versus URL openers
 
@@ -34,7 +37,7 @@ import"][] the driver package to link it in. See the
 both forms for each pub/sub provider.
 
 ["blank import"]: https://golang.org/doc/effective_go.html#blank_import
-[documentation on URLs]: https://godoc.org/gocloud.dev#hdr-URLs
+[documentation on URLs]: {{< ref "/concepts/urls.md" >}}
 
 ## Amazon Simple Notification Service {#sns}
 
@@ -45,7 +48,7 @@ application connects to the correct region, but otherwise `pubsub.OpenTopic`
 will use the region found in the environment variables or your AWS CLI
 configuration.
 
-{{< goexample "gocloud.dev/pubsub/awssnssqs.Example_openTopic" >}}
+{{< goexample "gocloud.dev/pubsub/awssnssqs.Example_openSNSTopicFromURL" >}}
 
 SNS messages are restricted to UTF-8 clean payloads. If your application
 sends a message that contains non-UTF-8 bytes, then the Go CDK will
@@ -61,12 +64,45 @@ you may need to manually Base64 decode the message payload.
 
 ### Amazon Simple Notification Service Constructor {#sns-ctor}
 
-The [`awssnssqs.OpenTopic`][] constructor opens an SNS topic. You must first
+The [`awssnssqs.OpenSNSTopic`][] constructor opens an SNS topic. You must first
 create an [AWS session][] with the same region as your topic:
 
-{{< goexample "gocloud.dev/pubsub/awssnssqs.ExampleOpenTopic" >}}
+{{< goexample "gocloud.dev/pubsub/awssnssqs.ExampleOpenSNSTopic" >}}
 
-[`awssnssqs.OpenTopic`]: https://godoc.org/gocloud.dev/pubsub/awssnssqs#OpenTopic
+[`awssnssqs.OpenSNSTopic`]: https://godoc.org/gocloud.dev/pubsub/awssnssqs#OpenSNSTopic
+[AWS session]: https://docs.aws.amazon.com/sdk-for-go/api/aws/session/
+
+## Amazon Simple Notification Service {#sqs}
+
+The Go CDK can publish to an Amazon [Simple Queue Service][SQS] (SQS)
+topic. SQS URLs closely resemble the the queue URL, except the leading
+`https://` is replaced with `awssqs://`. You can specify the `region`
+query parameter to ensure your application connects to the correct region, but
+otherwise `pubsub.OpenTopic` will use the region found in the environment
+variables or your AWS CLI configuration.
+
+{{< goexample "gocloud.dev/pubsub/awssnssqs.Example_openSQSTopicFromURL" >}}
+
+SQS messages are restricted to UTF-8 clean payloads. If your application
+sends a message that contains non-UTF-8 bytes, then the Go CDK will
+automatically [Base64][] encode the message and add a `base64encoded` message
+attribute. When subscribing to messages on the topic through the Go CDK,
+these will be [automatically Base64 decoded][SQS Subscribe], but if you are
+receiving messages from a topic in a program that does not use the Go CDK,
+you may need to manually Base64 decode the message payload.
+
+[Base64]: https://en.wikipedia.org/wiki/Base64
+[SQS Subscribe]: {{< relref "./subscribe.md#sqs" >}}
+[SQS]: https://aws.amazon.com/sqs/
+
+### Amazon Simple Queue Service Constructor {#sqs-ctor}
+
+The [`awssnssqs.OpenSQSTopic`][] constructor opens an SQS topic. You must first
+create an [AWS session][] with the same region as your topic:
+
+{{< goexample "gocloud.dev/pubsub/awssnssqs.ExampleOpenSQSTopic" >}}
+
+[`awssnssqs.OpenSQSTopic`]: https://godoc.org/gocloud.dev/pubsub/awssnssqs#OpenSQSTopic
 [AWS session]: https://docs.aws.amazon.com/sdk-for-go/api/aws/session/
 
 ## Google Cloud Pub/Sub {#gcp}
@@ -75,7 +111,7 @@ The Go CDK can publish to a Google [Cloud Pub/Sub][] topic. The URLs use the
 project ID and the topic ID. `pubsub.OpenTopic` will use [Application Default
 Credentials][GCP creds].
 
-{{< goexample "gocloud.dev/pubsub/gcppubsub.Example_openTopic" >}}
+{{< goexample "gocloud.dev/pubsub/gcppubsub.Example_openTopicFromURL" >}}
 
 [Cloud Pub/Sub]: https://cloud.google.com/pubsub/docs/
 [GCP creds]: https://cloud.google.com/docs/authentication/production
@@ -99,7 +135,7 @@ environment variable `SERVICEBUS_CONNECTION_STRING` to obtain the Service Bus
 connection string. The connection string can be obtained
 [from the Azure portal][Azure connection string].
 
-{{< goexample "gocloud.dev/pubsub/azuresb.Example_openTopic" >}}
+{{< goexample "gocloud.dev/pubsub/azuresb.Example_openTopicFromURL" >}}
 
 [AMQP 1.0]: https://www.amqp.org/
 [Azure connection string]: https://docs.microsoft.com/en-us/azure/service-bus-messaging/service-bus-dotnet-how-to-use-topics-subscriptions#get-the-connection-string
@@ -124,7 +160,7 @@ AMQP spoken by [RabbitMQ][]. A RabbitMQ URL only includes the exchange name.
 The RabbitMQ's server is discovered from the `RABBIT_SERVER_URL` environment
 variable (which is something like `amqp://guest:guest@localhost:5672/`).
 
-{{< goexample "gocloud.dev/pubsub/rabbitpubsub.Example_openTopic" >}}
+{{< goexample "gocloud.dev/pubsub/rabbitpubsub.Example_openTopicFromURL" >}}
 
 [AMQP 0.9.1]: https://www.rabbitmq.com/protocol.html
 [RabbitMQ]: https://www.rabbitmq.com
@@ -145,7 +181,7 @@ The Go CDK can publish to a [NATS][] subject. A NATS URL only includes the
 subject name. The NATS server is discovered from the `NATS_SERVER_URL`
 environment variable (which is something like `nats://nats.example.com`).
 
-{{< goexample "gocloud.dev/pubsub/natspubsub.Example_openTopic" >}}
+{{< goexample "gocloud.dev/pubsub/natspubsub.Example_openTopicFromURL" >}}
 
 Because NATS does not natively support metadata, messages sent to NATS will
 be encoded with [gob][].
@@ -170,7 +206,7 @@ topic name. The brokers in the Kafka cluster are discovered from the
 `KAFKA_BROKERS` environment variable (which is a comma-delimited list of
 hosts, something like `1.2.3.4:9092,5.6.7.8:9092`).
 
-{{< goexample "gocloud.dev/pubsub/kafkapubsub.Example_openTopic" >}}
+{{< goexample "gocloud.dev/pubsub/kafkapubsub.Example_openTopicFromURL" >}}
 
 [Kafka]: https://kafka.apache.org/
 
@@ -198,7 +234,7 @@ The names in `mem://` URLs are a process-wide namespace, so subscriptions to
 the same name will receive messages posted to that topic. This is detailed
 more in the [subscription guide][subscribe-mem].
 
-{{< goexample "gocloud.dev/pubsub/mempubsub.Example_openTopic" >}}
+{{< goexample "gocloud.dev/pubsub/mempubsub.Example_openTopicFromURL" >}}
 
 [subscribe-mem]: {{< ref "./subscribe.md#mem" >}}
 

@@ -15,76 +15,53 @@
 package main
 
 import (
-	"encoding/json"
-	"fmt"
-	"io/ioutil"
-	"os"
+	"context"
 	"path/filepath"
 
+	"github.com/spf13/cobra"
 	"golang.org/x/xerrors"
 )
 
-const biomeConfigFileName = "biome.json"
-
-// biomeConfig is the parsed configuration from a biome.json file.
-type biomeConfig struct {
-	ServeEnabled *bool   `json:"serve_enabled,omitempty"`
-	Launcher     *string `json:"launcher,omitempty"`
-}
-
-// findBiomeDir returns the path to the named biome.
-func findBiomeDir(moduleRoot, name string) string {
-	return filepath.Join(moduleRoot, "biomes", name)
-}
-
-// readBiomeConfig reads and parses the biome configuration from the filesystem.
-// If the configuration file could not be found, readBiomeConfig returns an
-// error for which xerrors.As(err, new(*biomeNotFoundError)) returns true.
-func readBiomeConfig(moduleRoot, biome string) (*biomeConfig, error) {
-	configPath := filepath.Join(findBiomeDir(moduleRoot, biome), biomeConfigFileName)
-	data, err := ioutil.ReadFile(configPath)
-	if os.IsNotExist(err) {
-		// TODO(light): Wrap error for formatting chain but not unwrap chain.
-		notFound := &biomeNotFoundError{
-			moduleRoot: moduleRoot,
-			biome:      biome,
-			frame:      xerrors.Caller(0),
-			detail:     err,
-		}
-		return nil, xerrors.Errorf("read biome %s configuration: %w", biome, notFound)
+func registerBiomeCmd(ctx context.Context, pctx *processContext, rootCmd *cobra.Command) {
+	biomeCmd := &cobra.Command{
+		Use:   "biome",
+		Short: "TODO Manage biomes",
+		Long:  "TODO more about biomes",
 	}
+	biomeAddCmd := &cobra.Command{
+		Use:   "add BIOME_NAME",
+		Short: "TODO Add BIOME_NAME",
+		Long:  "TODO more about adding biomes",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(_ *cobra.Command, args []string) error {
+			return biomeAdd(ctx, pctx, args[0])
+		},
+	}
+	biomeCmd.AddCommand(biomeAddCmd)
+
+	// TODO(rvangent): More biome subcommands.
+
+	rootCmd.AddCommand(biomeCmd)
+}
+
+func biomeAdd(ctx context.Context, pctx *processContext, newName string) error {
+	// TODO(clausti) interpolate launcher from one supplied as a flag
+	pctx.Logf("Adding biome %q...", newName)
+
+	moduleRoot, err := pctx.ModuleRoot(ctx)
 	if err != nil {
-		return nil, xerrors.Errorf("read biome %s configuration: %w", err)
+		return xerrors.Errorf("biome add: %w", err)
 	}
-	config := new(biomeConfig)
-	if err := json.Unmarshal(data, config); err != nil {
-		return nil, xerrors.Errorf("read biome %s configuration: %w", err)
+	dstPath := biomeDir(moduleRoot, newName)
+	data := struct {
+		ProjectName string
+	}{
+		ProjectName: filepath.Base(moduleRoot),
 	}
-	return config, nil
-}
 
-// biomeNotFoundError is an error returned when a biome cannot be found.
-type biomeNotFoundError struct {
-	moduleRoot string
-	biome      string
-	frame      xerrors.Frame
-	detail     error
-}
-
-func (e *biomeNotFoundError) Error() string {
-	return fmt.Sprintf("biome %s not found", e.biome)
-}
-
-func (e *biomeNotFoundError) FormatError(p xerrors.Printer) error {
-	p.Print(e.Error())
-	if !p.Detail() {
-		return nil
+	if err := materializeTemplateDir(dstPath, "biome", data); err != nil {
+		return xerrors.Errorf("gocdk biome add: %w", err)
 	}
-	p.Printf("biome = %q", findBiomeDir(e.moduleRoot, e.biome))
-	e.frame.Format(p)
-	return e.detail
-}
-
-func (e *biomeNotFoundError) Format(f fmt.State, c rune) {
-	xerrors.FormatError(e, f, c)
+	pctx.Logf("Success!")
+	return nil
 }

@@ -24,6 +24,21 @@ import (
 
 // A Collection is a set of documents.
 type Collection interface {
+	// Key returns the document key, or nil if the document doesn't have one.
+	// If the collection is able to generate a key for a Create action, then
+	// it should not return an error if the key is missing. If the collection
+	// can't generate a missing key, it should return an error.
+	//
+	// The returned key must be comparable.
+	//
+	// The returned key should not be encoded with the provider's codec; it should
+	// be the user-supplied Go value.
+	Key(Document) (interface{}, error)
+
+	// RevisionField returns the name of the field used to hold revisions.
+	// If the empty string is returned, docstore.RevisionField will be used.
+	RevisionField() string
+
 	// RunActions executes a slice of actions.
 	//
 	// If unordered is false, it must appear as if the actions were executed in the
@@ -44,12 +59,24 @@ type Collection interface {
 	// multiple ones, depending on their service offerings.
 	RunGetQuery(context.Context, *Query) (DocumentIterator, error)
 
+	// RunDeleteQuery deletes every document matched by the query.
+	RunDeleteQuery(context.Context, *Query) error
+
+	// RunUpdateQuery updates every document matched by the query.
+	RunUpdateQuery(context.Context, *Query, []Mod) error
+
 	// QueryPlan returns the plan for the query.
 	QueryPlan(*Query) (string, error)
 
 	// As converts i to provider-specific types.
-	// See https://godoc.org/gocloud.dev#hdr-As for background information.
+	// See https://gocloud.dev/concepts/as/ for background information.
 	As(i interface{}) bool
+
+	// ErrorAs allows providers to expose provider-specific types for returned
+	// errors.
+	//
+	// See https://gocloud.dev/concepts/as/ for background information.
+	ErrorAs(err error, i interface{}) bool
 
 	// ErrorCode should return a code that describes the error, which was returned by
 	// one of the other methods in this interface.
@@ -68,12 +95,16 @@ const (
 	Update
 )
 
+//go:generate stringer -type=ActionKind
+
 // An Action describes a single operation on a single document.
 type Action struct {
-	Kind       ActionKind // the kind of action
-	Doc        Document   // the document on which to perform the action
-	FieldPaths [][]string // field paths to retrieve, for Get only
-	Mods       []Mod      // modifications to make, for Update only
+	Kind       ActionKind  // the kind of action
+	Doc        Document    // the document on which to perform the action
+	Key        interface{} // the document key returned by Collection.Key, to avoid recomputing it
+	FieldPaths [][]string  // field paths to retrieve, for Get only
+	Mods       []Mod       // modifications to make, for Update only
+	Index      int         // the index of the action in the original action list
 }
 
 // A Mod is a modification to a field path in a document.
@@ -83,6 +114,11 @@ type Action struct {
 type Mod struct {
 	FieldPath []string
 	Value     interface{}
+}
+
+// A value representing an increment modification.
+type IncOp struct {
+	Amount interface{}
 }
 
 // An ActionListError contains all the errors encountered from a call to RunActions,
@@ -110,11 +146,6 @@ func NewActionListError(errs []error) ActionListError {
 
 // RunActionsOptions controls the behavior of RunActions.
 type RunActionsOptions struct {
-	// Unordered let the actions be executed in any order, perhaps concurrently.
-	// All of the actions should be executed, even if some fail. The returned
-	// ActionListError should have an element for each action that fails.
-	Unordered bool
-
 	// BeforeDo is a callback that must be called exactly once before each one or
 	// group of the underlying provider's actions is executed. asFunc allows
 	// providers to expose provider-specific types.
@@ -136,6 +167,12 @@ type Query struct {
 	// Limit sets the maximum number of results returned by running the query. When
 	// Limit <= 0, the driver implementation should return all possible results.
 	Limit int
+
+	// OrderByField is the field to use for sorting the results.
+	OrderByField string
+
+	// OrderAscending specifies the sort direction.
+	OrderAscending bool
 
 	// BeforeQuery is a callback that must be called exactly once before the
 	// underlying provider's query is executed. asFunc allows providers to expose
@@ -167,7 +204,7 @@ type DocumentIterator interface {
 	Stop()
 
 	// As converts i to provider-specific types.
-	// See https://godoc.org/gocloud.dev#hdr-As for background information.
+	// See https://gocloud.dev/concepts/as/ for background information.
 	As(i interface{}) bool
 }
 

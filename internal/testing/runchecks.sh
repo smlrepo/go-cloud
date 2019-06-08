@@ -25,11 +25,10 @@ if [[ $# -gt 0 ]]; then
   exit 64
 fi
 
-
 # The following logic lets us skip the (lengthy) installation process and tests
 # in some cases where the PR carries trivial changes that don't affect the code
 # (such as documentation-only).
-if [[ ! -z "$TRAVIS_BRANCH" ]] && [[ ! -z "$TRAVIS_PULL_REQUEST_SHA" ]]; then
+if [[ ! -z "${TRAVIS_BRANCH:-}" ]] && [[ ! -z "${TRAVIS_PULL_REQUEST_SHA:-}" ]]; then
   tmpfile=$(mktemp)
   function cleanup() {
     rm -rf "$tmpfile"
@@ -41,7 +40,7 @@ if [[ ! -z "$TRAVIS_BRANCH" ]] && [[ ! -z "$TRAVIS_PULL_REQUEST_SHA" ]]; then
     echo "merge-base empty. Please ensure that the PR is mergeable."
     exit 1
   fi
-  git diff --name-only "$mergebase" "$TRAVIS_PULL_REQUEST_SHA" -- > $tmpfile
+  git diff --name-only "$mergebase" "$TRAVIS_PULL_REQUEST_SHA" -- > "$tmpfile"
 
   # Find out if the diff has any files that are neither:
   #
@@ -51,8 +50,8 @@ if [[ ! -z "$TRAVIS_BRANCH" ]] && [[ ! -z "$TRAVIS_PULL_REQUEST_SHA" ]]; then
   # If there are no such files, grep returns 1 and we don't have to run the
   # tests.
   echo "The following files changed:"
-  cat $tmpfile
-  if grep -vP "(^internal/website|.md$)" $tmpfile; then
+  cat "$tmpfile"
+  if grep -vP "(^internal/website|.md$)" "$tmpfile"; then
     echo "--> Found some non-trivial changes, running tests"
   else
     echo "--> Diff doesn't affect tests; not running them"
@@ -63,48 +62,113 @@ fi
 
 # start_local_deps.sh requires that Docker is installed, via Travis services,
 # which are only supported on Linux.
-# Without the dependencies running, tests that depend on them are skipped.
-if [[ "$TRAVIS_OS_NAME" == "linux" ]]; then
+# Tests that depend on them should check the Travis environment before running.
+# Don't do this when running locally, as it's slow; user should do it.
+if [[ "${TRAVIS_OS_NAME:-}" == "linux" ]]; then
   echo
   echo "Starting local dependencies..."
   ./internal/testing/start_local_deps.sh
+  echo
+  echo "Installing Wire..."
+  go install -mod=readonly github.com/google/wire/cmd/wire
 fi
 
-
-# Run Go tests for the root. Only do coverage for the Linux build
-# because it is slow, and codecov will only save the last one anyway.
 result=0
-echo
-echo "Running Go tests..."
-if [[ "$TRAVIS_OS_NAME" == "linux" ]]; then
-  go test -mod=readonly -race -coverpkg=./... -coverprofile=coverage.out ./... || result=1
-  if [ -f coverage.out ] && [ $result -eq 0 ]; then
-    # Filter out test and sample packages.
-    grep -v test coverage.out | grep -v samples > coverage2.out
-    mv coverage2.out coverage.out
-    bash <(curl -s https://codecov.io/bash)
+
+rootdir="$(pwd)"
+while read -r path || [[ -n "$path" ]]; do
+  echo
+  echo "******************************"
+  echo "* Checking module: $path"
+  echo "******************************"
+  echo
+  pushd "$path" &> /dev/null
+
+  # Run Go tests.
+  # Only do coverage for the Linux build on Travis because it is slow, and
+  # codecov will only save the last one anyway.
+  if [[ "${TRAVIS_OS_NAME:-}" == "linux" ]]; then
+    echo "Running Go tests with coverage..."
+    go test -mod=readonly -json -race -coverpkg=./... -coverprofile=modcoverage.out ./... | go run "$rootdir"/internal/testing/test-summary/test-summary.go -progress || result=1
+    if [ -f modcoverage.out ] && [ $result -eq 0 ]; then
+      cat modcoverage.out >> "$rootdir"/coverage.out
+      rm modcoverage.out
+    fi
+  else
+    echo "Running Go tests..."
+    # TODO(rvangent): Special case modules to skip for Windows. Perhaps
+    # this should be data-driven by allmodules?
+    # (https://github.com/google/go-cloud/issues/2111).
+    if [[ "${TRAVIS_OS_NAME:-}" == "windows" ]] && ([[ "$path" == "internal/contributebot" ]] || [[ "$path" == "internal/website" ]]); then
+      echo "  Skipping tests on Window"
+    else
+      go test -mod=readonly -json -race ./... | go run "$rootdir"/internal/testing/test-summary/test-summary.go -progress || result=1
+    fi
   fi
-else
-  go test -mod=readonly -race ./... || result=1
-  # No need to run other checks on OSs other than linux.
+
+  # Do these additional checks for the Linux build on Travis, or when running
+  # locally.
+  if [[ "${TRAVIS_OS_NAME:-linux}" == "linux" ]]; then
+    echo "Running go mod tidy:"
+    ( "$rootdir"/internal/testing/check_mod_tidy.sh && echo "  OK" ) || { echo "FAIL: please run ./internal/testing/gomodcleanup.sh" && result=1; }
+    echo "Running wire diff:"
+    ( wire diff ./... && echo "  OK" ) || { echo "FAIL: wire diff found diffs!" && result=1; }
+  fi
+  popd &> /dev/null
+done < <( sed -e '/^#/d' -e '/^$/d' allmodules | awk '{print $1}' )
+# The above filters out comments and empty lines from allmodules and only takes
+# the first (whitespace-separated) field from each line.
+
+# Upload cumulative coverage data if we generated it.
+if [ -f coverage.out ] && [ $result -eq 0 ]; then
+  # Filter out test packages.
+  grep -v test coverage.out > coverage2.out
+  mv coverage2.out coverage.out
+  bash <(curl -s https://codecov.io/bash)
+  rm coverage.out
+fi
+
+# The rest of these checks are not OS-specific, so we only run them for the
+# Linux build on Travis, or when running locally.
+if [[ "${TRAVIS_OS_NAME:-linux}" != "linux" ]]; then
   exit $result
 fi
 
-
+echo
+echo "******************************"
+echo "* Doing non-module checks"
+echo "******************************"
 echo
 echo "Ensuring .go files are formatted with gofmt -s..."
-DIFF=$(gofmt -s -d `find . -name '*.go' -type f`)
+DIFF="$(gofmt -s -d .)"
 if [ -n "$DIFF" ]; then
-  echo "FAIL: please run gofmt -s and commit the result"
+  echo "FAIL: please run 'gofmt -s -w .' and commit the result"
   echo "$DIFF";
   exit 1;
+else
+  echo "  OK"
 fi;
 
 
 echo
-echo "Ensuring that there are no dependencies not listed in ./internal/testing/alldeps..."
-if [[ $(go version) == *1\.12* ]]; then
-  ./internal/testing/listdeps.sh | diff ./internal/testing/alldeps - || {
+echo "Ensuring that gocdk compiled assets are up to date..."
+tmpvfsdatago=$(mktemp)
+function cleanupstaticgo() {
+  rm -rf "$tmpvfsdatago"
+}
+trap cleanupstaticgo EXIT
+pushd internal/cmd/gocdk/ &> /dev/null
+go run -mod=readonly generate_static.go -- "$tmpvfsdatago" &> /dev/null
+( diff -u static/vfsdata.go - < "$tmpvfsdatago" && echo "  OK" ) || {
+  echo "FAIL: gocdk compiled assets are out of date; please run go generate in internal/cmd/gocdk and commit the updated static/vfsdata.go" && result=1
+}
+popd &> /dev/null
+
+
+if [[ $(go version) == *go1\.12* ]]; then
+  echo
+  echo "Ensuring that there are no dependencies not listed in ./internal/testing/alldeps..."
+  ( ./internal/testing/listdeps.sh | diff -u ./internal/testing/alldeps - && echo "  OK" ) || {
     echo "FAIL: dependencies changed; run: internal/testing/listdeps.sh > internal/testing/alldeps" && result=1
     # Module behavior may differ across versions.
     echo "using go version 1.12."
@@ -119,41 +183,32 @@ if ! [[ -z "$missing_packages" ]]; then
   echo "FAIL: missing package meta tags for:" 1>&2
   echo "$missing_packages" 1>&2
   result=1
+else
+  echo "  OK"
 fi
 
 
 echo
 echo "Ensuring that all examples used in Hugo match what's in source..."
-internal/website/gatherexamples/run.sh | diff internal/website/data/examples.json - > /dev/null || {
+(internal/website/gatherexamples/run.sh | diff -u internal/website/data/examples.json - > /dev/null && echo "  OK") || {
   echo "FAIL: examples changed; run: internal/website/gatherexamples/run.sh > internal/website/data/examples.json"
   result=1
 }
 
+
 # For pull requests, check if there are undeclared incompatible API changes.
 # Skip this if we're already going to fail since it is expensive.
-if [[ ${result} -eq 0 ]] && [[ ! -z "$TRAVIS_BRANCH" ]] && [[ ! -z "$TRAVIS_PULL_REQUEST_SHA" ]]; then
+if [[ ${result} -eq 0 ]] && [[ ! -z "${TRAVIS_BRANCH:-}" ]] && [[ ! -z "${TRAVIS_PULL_REQUEST_SHA:-}" ]]; then
   echo
   ./internal/testing/check_api_change.sh || result=1;
 fi
 
 
 echo
-echo "Checking for wire problems or diffs..."
-go install -mod=readonly github.com/google/wire/cmd/wire
-wire check ./... || result=1
-# "wire diff" fails with exit code 1 if any diffs are detected.
-wire diff ./... || {
-  echo "FAIL: wire diff found diffs!";
-  result=1;
-}
+if [[ ${result} -eq 0 ]]; then
+  echo "SUCCESS!"
+else
+  echo "FAILED; see above for more info."
+fi
 
-echo
-echo "Running Go tests for sub-modules..."
-for path in "./internal/cmd/gocdk" "./internal/contributebot" "./internal/website" "./samples/appengine"; do
-  echo "Running tests in $path..."
-  ( cd "$path" && exec go test -mod=readonly ./... ) || result=1
-  echo "Running wire checks in $path..."
-  ( cd "$path" && exec wire check ./... ) || result=1
-  ( cd "$path" && exec wire diff ./... ) || (echo "FAIL: wire diff found diffs!" && result=1)
-done
 exit $result

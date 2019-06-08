@@ -20,7 +20,7 @@
 // For blob.OpenBucket memblob registers for the scheme "mem".
 // To customize the URL opener, or for more details on the URL format,
 // see URLOpener.
-// See https://godoc.org/gocloud.dev#hdr-URLs for background information.
+// See https://gocloud.dev/concepts/urls/ for background information.
 //
 // As
 //
@@ -269,7 +269,7 @@ func (r *reader) As(i interface{}) bool { return false }
 // NewTypedWriter implements driver.NewTypedWriter.
 func (b *bucket) NewTypedWriter(ctx context.Context, key string, contentType string, opts *driver.WriterOptions) (driver.Writer, error) {
 	if key == "" {
-		return nil, errors.New("invalid key (empty string(")
+		return nil, errors.New("invalid key (empty string)")
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()

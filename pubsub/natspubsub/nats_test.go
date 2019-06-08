@@ -27,9 +27,9 @@ import (
 	"gocloud.dev/pubsub/drivertest"
 
 	"github.com/google/go-cmp/cmp"
-	"github.com/nats-io/gnatsd/server"
-	gnatsd "github.com/nats-io/gnatsd/test"
-	"github.com/nats-io/go-nats"
+	"github.com/nats-io/nats-server/v2/server"
+	gnatsd "github.com/nats-io/nats-server/v2/test"
+	"github.com/nats-io/nats.go"
 )
 
 const (
@@ -68,7 +68,7 @@ func (h *harness) MakeNonexistentTopic(ctx context.Context) (driver.Topic, error
 }
 
 func (h *harness) CreateSubscription(ctx context.Context, dt driver.Topic, testName string) (driver.Subscription, func(), error) {
-	ds, err := openSubscription(h.nc, testName, func() {})
+	ds, err := openSubscription(h.nc, testName)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -91,6 +91,8 @@ func (h *harness) Close() {
 }
 
 func (h *harness) MaxBatchSizes() (int, int) { return 0, 0 }
+
+func (*harness) SupportsMultipleSubscriptions() bool { return true }
 
 type natsAsTest struct{}
 
@@ -192,7 +194,7 @@ func TestInteropWithDirectNATS(t *testing.T) {
 	}
 
 	// Send a message using NATS directly and receive it using Go CDK.
-	ps, err := OpenSubscription(conn, topic, func() { t.Fatal("ack called unexpectedly") }, nil)
+	ps, err := OpenSubscription(conn, topic, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -200,6 +202,10 @@ func TestInteropWithDirectNATS(t *testing.T) {
 		t.Fatal(err)
 	}
 	msg, err := ps.Receive(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer msg.Ack()
 	if !bytes.Equal(msg.Body, body) {
 		t.Fatalf("Data did not match. %q vs %q\n", m.Data, body)
 	}
@@ -240,7 +246,7 @@ func TestErrorCode(t *testing.T) {
 	}
 
 	// Subscriptions
-	ds, err := openSubscription(h.nc, "bar", func() { t.Fatal("ack called unexpectedly") })
+	ds, err := openSubscription(h.nc, "bar")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -273,8 +279,6 @@ func TestErrorCode(t *testing.T) {
 	}
 }
 
-/* Temporarily disabled due to #1556, a data race in NATS.
-
 func TestBadSubjects(t *testing.T) {
 	ctx := context.Background()
 	dh, err := newHarness(ctx, t)
@@ -284,7 +288,7 @@ func TestBadSubjects(t *testing.T) {
 	defer dh.Close()
 	h := dh.(*harness)
 
-	sub, err := CreateSubscription(h.nc, "..bad", func() { t.Fatal("ack called unexpectedly") }, nil)
+	sub, err := OpenSubscription(h.nc, "..bad", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -292,7 +296,7 @@ func TestBadSubjects(t *testing.T) {
 		t.Fatal("Expected an error with bad subject")
 	}
 
-	pt, err := CreateTopic(h.nc, "..bad", nil)
+	pt, err := OpenTopic(h.nc, "..bad", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -300,7 +304,6 @@ func TestBadSubjects(t *testing.T) {
 		t.Fatal("Expected an error with bad subject")
 	}
 }
-*/
 
 func BenchmarkNatsPubSub(b *testing.B) {
 	ctx := context.Background()
@@ -393,14 +396,6 @@ func TestOpenSubscriptionFromURL(t *testing.T) {
 	}{
 		// OK.
 		{"nats://mytopic", false},
-		// OK, setting ackfunc.
-		{"nats://mytopic?ackfunc=log", false},
-		// OK, setting ackfunc.
-		{"nats://mytopic?ackfunc=panic", false},
-		// OK, setting ackfunc.
-		{"nats://mytopic?ackfunc=noop", false},
-		// Invalid ackfunc.
-		{"nats://mytopic?ackfunc=fail", true},
 		// Invalid parameter.
 		{"nats://mytopic?param=value", true},
 	}

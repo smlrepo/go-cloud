@@ -36,11 +36,6 @@ func ExampleOpenTopic() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	// Get the project ID from the credentials (required by OpenTopic).
-	projectID, err := gcp.DefaultProjectID(creds)
-	if err != nil {
-		log.Fatal(err)
-	}
 	// Open a gRPC connection to the GCP Pub/Sub API.
 	conn, cleanup, err := gcppubsub.Dial(ctx, creds.TokenSource)
 	if err != nil {
@@ -56,11 +51,14 @@ func ExampleOpenTopic() {
 	defer pubClient.Close()
 
 	// Construct a *pubsub.Topic.
-	topic := gcppubsub.OpenTopic(pubClient, projectID, "example-topic", nil)
+	topic, err := gcppubsub.OpenTopicByPath(pubClient, "projects/myprojectID/topics/example-topic", nil)
+	if err != nil {
+		log.Fatal(err)
+	}
 	defer topic.Shutdown(ctx)
 }
 
-func Example_openTopic() {
+func Example_openTopicFromURL() {
 	// This example is used in https://gocloud.dev/howto/pubsub/publish/#gcp
 
 	// import _ "gocloud.dev/pubsub/gcppubsub"
@@ -68,7 +66,7 @@ func Example_openTopic() {
 	// Variables set up elsewhere:
 	ctx := context.Background()
 
-	topic, err := pubsub.OpenTopic(ctx, "gcppubsub://myproject/mytopic")
+	topic, err := pubsub.OpenTopic(ctx, "gcppubsub://projects/myproject/topics/mytopic")
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -88,11 +86,6 @@ func ExampleOpenSubscription() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	// Get the project ID from the credentials (required by OpenSubscription).
-	projectID, err := gcp.DefaultProjectID(creds)
-	if err != nil {
-		log.Fatal(err)
-	}
 
 	// Open a gRPC connection to the GCP Pub/Sub API.
 	conn, cleanup, err := gcppubsub.Dial(ctx, creds.TokenSource)
@@ -109,12 +102,15 @@ func ExampleOpenSubscription() {
 	defer subClient.Close()
 
 	// Construct a *pubsub.Subscription.
-	subscription := gcppubsub.OpenSubscription(
-		subClient, projectID, "example-subscription", nil)
+	subscription, err := gcppubsub.OpenSubscriptionByPath(
+		subClient, "projects/myprojectID/subscriptions/example-subscription", nil)
+	if err != nil {
+		log.Fatal(err)
+	}
 	defer subscription.Shutdown(ctx)
 }
 
-func Example_openSubscription() {
+func Example_openSubscriptionFromURL() {
 	// This example is used in https://gocloud.dev/howto/pubsub/subscribe/#gcp
 
 	// import _ "gocloud.dev/pubsub/gcppubsub"
@@ -123,7 +119,7 @@ func Example_openSubscription() {
 	ctx := context.Background()
 
 	subscription, err := pubsub.OpenSubscription(ctx,
-		"gcppubsub://my-project/my-subscription")
+		"gcppubsub://projects/my-project/subscriptions/my-subscription")
 	if err != nil {
 		log.Fatal(err)
 	}

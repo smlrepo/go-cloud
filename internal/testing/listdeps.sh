@@ -28,8 +28,9 @@ function cleanup() {
 }
 trap cleanup EXIT
 
-for path in "." "./internal/cmd/gocdk" "./internal/contributebot" "./internal/website" "./samples/appengine"; do
-  ( cd "$path" && go list -deps -f '{{with .Module}}{{.Path}}{{end}}' ./... >> $tmpfile)
+
+sed -e '/^#/d' -e '/^$/d' allmodules | awk '{print $1}' | while read -r path || [[ -n "$path" ]]; do
+  ( cd "$path" && go list -mod=readonly -deps -f '{{with .Module}}{{.Path}}{{end}}' ./... >> "$tmpfile")
 done
 
 # Sort using the native byte values to keep results from different environment consistent.

@@ -17,8 +17,8 @@ package memdocstore
 import (
 	"fmt"
 	"reflect"
+	"time"
 
-	"gocloud.dev/internal/docstore"
 	"gocloud.dev/internal/docstore/driver"
 )
 
@@ -31,21 +31,37 @@ func encodeDoc(doc driver.Document) (map[string]interface{}, error) {
 	return e.val.(map[string]interface{}), nil
 }
 
+func encodeValue(v interface{}) (interface{}, error) {
+	var e encoder
+	if err := driver.Encode(reflect.ValueOf(v), &e); err != nil {
+		return nil, err
+	}
+	return e.val, nil
+}
+
 type encoder struct {
 	val interface{}
 }
 
-func (e *encoder) EncodeNil()                                { e.val = nil }
-func (e *encoder) EncodeBool(x bool)                         { e.val = x }
-func (e *encoder) EncodeInt(x int64)                         { e.val = x }
-func (e *encoder) EncodeUint(x uint64)                       { e.val = int64(x) }
-func (e *encoder) EncodeBytes(x []byte)                      { e.val = x }
-func (e *encoder) EncodeFloat(x float64)                     { e.val = x }
-func (e *encoder) EncodeComplex(x complex128)                { e.val = x }
-func (e *encoder) EncodeString(x string)                     { e.val = x }
-func (e *encoder) ListIndex(int)                             { panic("impossible") }
-func (e *encoder) MapKey(string)                             { panic("impossible") }
-func (e *encoder) EncodeSpecial(reflect.Value) (bool, error) { return false, nil } // no special handling
+func (e *encoder) EncodeNil()            { e.val = nil }
+func (e *encoder) EncodeBool(x bool)     { e.val = x }
+func (e *encoder) EncodeInt(x int64)     { e.val = x }
+func (e *encoder) EncodeUint(x uint64)   { e.val = int64(x) }
+func (e *encoder) EncodeBytes(x []byte)  { e.val = x }
+func (e *encoder) EncodeFloat(x float64) { e.val = x }
+func (e *encoder) EncodeString(x string) { e.val = x }
+func (e *encoder) ListIndex(int)         { panic("impossible") }
+func (e *encoder) MapKey(string)         { panic("impossible") }
+
+var typeOfGoTime = reflect.TypeOf(time.Time{})
+
+func (e *encoder) EncodeSpecial(v reflect.Value) (bool, error) {
+	if v.Type() == typeOfGoTime {
+		e.val = v.Interface()
+		return true, nil
+	}
+	return false, nil
+}
 
 func (e *encoder) EncodeList(n int) driver.Encoder {
 	// All slices and arrays are encoded as []interface{}
@@ -77,14 +93,14 @@ func (e *mapEncoder) MapKey(k string) { e.m[k] = e.val }
 ////////////////////////////////////////////////////////////////
 
 // decodeDoc decodes m into ddoc.
-func decodeDoc(m map[string]interface{}, ddoc driver.Document, fps [][]string) error {
+func decodeDoc(m map[string]interface{}, ddoc driver.Document, fps [][]string, revField string) error {
 	var m2 map[string]interface{}
 	if len(fps) == 0 {
 		m2 = m
 	} else {
 		// Make a document to decode from that has only the field paths and the revision field.
 		// (We don't need the key field because ddoc must already have it.)
-		m2 = map[string]interface{}{docstore.RevisionField: m[docstore.RevisionField]}
+		m2 = map[string]interface{}{revField: m[revField]}
 		for _, fp := range fps {
 			val, err := getAtFieldPath(m, fp)
 			if err != nil {
@@ -135,11 +151,6 @@ func (d decoder) AsFloat() (float64, bool) {
 	return f, ok
 }
 
-func (d decoder) AsComplex() (complex128, bool) {
-	c, ok := d.val.(complex128)
-	return c, ok
-}
-
 func (d decoder) AsBytes() ([]byte, bool) {
 	bs, ok := d.val.([]byte)
 	return bs, ok
@@ -179,6 +190,9 @@ func (d decoder) DecodeMap(f func(key string, d2 driver.Decoder) bool) {
 	}
 }
 
-func (decoder) AsSpecial(reflect.Value) (bool, interface{}, error) {
+func (d decoder) AsSpecial(v reflect.Value) (bool, interface{}, error) {
+	if v.Type() == typeOfGoTime {
+		return true, d.val, nil
+	}
 	return false, nil, nil
 }

@@ -16,7 +16,6 @@ package main
 
 import (
 	"context"
-	"flag"
 	"fmt"
 	"io/ioutil"
 	"log"
@@ -27,31 +26,37 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"sync/atomic"
 	"time"
 
+	"github.com/spf13/cobra"
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/xerrors"
 )
 
-func serve(ctx context.Context, pctx *processContext, args []string) error {
-	f := newFlagSet(pctx, "serve")
-	opts := new(serveOptions)
-	f.StringVar(&opts.address, "address", "localhost:8080", "`host:port` address to serve on")
-	f.StringVar(&opts.biome, "biome", "dev", "`name` of biome to apply and use configuration from")
-	if err := f.Parse(args); xerrors.Is(err, flag.ErrHelp) {
-		return nil
-	} else if err != nil {
-		return usagef("gocdk serve: %w", err)
+func registerServeCmd(ctx context.Context, pctx *processContext, rootCmd *cobra.Command) {
+	var opts serveOptions
+	serveCmd := &cobra.Command{
+		Use:   "serve",
+		Short: "TODO Run an auto-reloading local server",
+		Long:  "TODO more about serve",
+		Args:  cobra.ExactArgs(0),
+		RunE: func(_ *cobra.Command, _ []string) error {
+			return serve(ctx, pctx, &opts)
+		},
 	}
-	if f.NArg() != 0 {
-		return usagef("gocdk serve [options]")
-	}
+	serveCmd.Flags().StringVar(&opts.address, "address", "localhost:8080", "`host:port` address to serve on")
+	serveCmd.Flags().StringVar(&opts.biome, "biome", "dev", "`name` of biome to apply and use configuration from")
+	serveCmd.Flags().DurationVar(&opts.pollInterval, "poll-interval", 500*time.Millisecond, "time between checking project directory for changes")
+	rootCmd.AddCommand(serveCmd)
+}
 
+func serve(ctx context.Context, pctx *processContext, opts *serveOptions) error {
 	// Check first that we're in a Go module.
 	var err error
-	opts.moduleRoot, err = findModuleRoot(ctx, pctx.workdir)
+	opts.moduleRoot, err = pctx.ModuleRoot(ctx)
 	if err != nil {
 		return xerrors.Errorf("gocdk serve: %w", err)
 	}
@@ -62,7 +67,7 @@ func serve(ctx context.Context, pctx *processContext, args []string) error {
 		// TODO(light): Keep err in formatting chain for debugging.
 		return xerrors.Errorf("gocdk serve: biome configuration not found for %s. "+
 			"Make sure that %s exists and has `\"serve_enabled\": true`.",
-			opts.biome, filepath.Join(findBiomeDir(opts.moduleRoot, opts.biome), biomeConfigFileName))
+			opts.biome, filepath.Join(biomeDir(opts.moduleRoot, opts.biome), biomeConfigFileName))
 	}
 	if err != nil {
 		return xerrors.Errorf("gocdk serve: %w", err)
@@ -70,7 +75,7 @@ func serve(ctx context.Context, pctx *processContext, args []string) error {
 	if biomeConfig.ServeEnabled == nil || !*biomeConfig.ServeEnabled {
 		return xerrors.Errorf("gocdk serve: biome %s has not enabled serving. "+
 			"Add `\"serve_enabled\": true` to %s and try again.",
-			opts.biome, filepath.Join(findBiomeDir(opts.moduleRoot, opts.biome), biomeConfigFileName))
+			opts.biome, filepath.Join(biomeDir(opts.moduleRoot, opts.biome), biomeConfigFileName))
 	}
 
 	// Start reverse proxy on address.
@@ -86,9 +91,8 @@ func serve(ctx context.Context, pctx *processContext, args []string) error {
 	})
 
 	// Start main build loop.
-	logger := log.New(pctx.stderr, "gocdk: ", log.Ldate|log.Ltime)
 	group.Go(func() error {
-		return serveBuildLoop(groupCtx, pctx, logger, myProxy, opts)
+		return serveBuildLoop(groupCtx, pctx, pctx.errlog, myProxy, opts)
 	})
 	if err := group.Wait(); err != nil {
 		return xerrors.Errorf("gocdk serve: %w", err)
@@ -97,9 +101,10 @@ func serve(ctx context.Context, pctx *processContext, args []string) error {
 }
 
 type serveOptions struct {
-	moduleRoot string
-	biome      string
-	address    string
+	moduleRoot   string
+	biome        string
+	address      string
+	pollInterval time.Duration
 
 	// actualAddress is the local address that the reverse proxy is
 	// listening on.
@@ -130,7 +135,7 @@ func serveBuildLoop(ctx context.Context, pctx *processContext, logger *log.Logge
 	}()
 
 	// Apply Terraform configuration in biome.
-	if err := apply(ctx, pctx, []string{opts.biome}); err != nil {
+	if err := apply(ctx, pctx, opts.biome, false); err != nil {
 		return err
 	}
 
@@ -143,6 +148,10 @@ func serveBuildLoop(ctx context.Context, pctx *processContext, logger *log.Logge
 		exePath: filepath.Join(buildDir, "serverB"),
 		port:    opts.actualAddress.Port + 2,
 	}
+	if runtime.GOOS == "windows" {
+		allocA.exePath += ".EXE"
+		allocB.exePath += ".EXE"
+	}
 	spareAlloc, liveAlloc := allocA, allocB
 	var process *exec.Cmd
 loop:
@@ -150,12 +159,51 @@ loop:
 		// After the first iteration of the loop, each iteration should wait for a
 		// change in the filesystem before proceeding.
 		if !first {
-			// TODO(#1881): Actually check filesystem instead of SIGUSR1.
+			watchCtx, cancelWatch := context.WithCancel(ctx)
+			watchDone := make(chan error)
+			go func() {
+				watchDone <- waitForDirChange(watchCtx, opts.moduleRoot, opts.pollInterval)
+			}()
 			select {
 			case <-reload:
-			case <-ctx.Done():
-				break loop
+				// Manual rebuild signal.
+				cancelWatch()
+				<-watchDone // Wait on watch goroutine.
+			case err := <-watchDone:
+				cancelWatch()
+				if err != nil {
+					if !xerrors.Is(err, context.DeadlineExceeded) && !xerrors.Is(err, context.Canceled) {
+						logger.Printf("Watch failed: %v", err)
+					}
+					break loop
+				}
 			}
+
+			logger.Println("Refreshing biome...")
+			if err := refreshBiome(ctx, opts.moduleRoot, opts.biome, pctx.env); err != nil {
+				// The Terraform configuration succeeded at least once, so Terraform
+				// outputs will still be somewhat consistent. We don't want to stop the
+				// build in case communicating with the cloud is flaky.
+				logger.Printf("WARNING: %v", err)
+			}
+		}
+
+		// Read output from Terraform built during apply or refresh.
+		tfOutput, err := tfReadOutput(ctx, biomeDir(opts.moduleRoot, opts.biome), pctx.env)
+		if err != nil {
+			logger.Printf("Terraform: %v", err)
+			if process == nil {
+				myProxy.setBuildError(err)
+			}
+			continue
+		}
+		procEnv, err := launchEnv(tfOutput)
+		if err != nil {
+			logger.Printf("Terraform: %v", err)
+			if process == nil {
+				myProxy.setBuildError(err)
+			}
+			continue
 		}
 
 		// Build and run the server.
@@ -167,7 +215,7 @@ loop:
 			}
 			continue
 		}
-		newProcess, err := spareAlloc.start(ctx, pctx, logger, opts.moduleRoot)
+		newProcess, err := spareAlloc.start(ctx, pctx, logger, opts.moduleRoot, procEnv)
 		if err != nil {
 			logger.Printf("Starting server: %v", err)
 			if process == nil {
@@ -198,28 +246,22 @@ loop:
 }
 
 // buildForServe runs Wire and `go build` at moduleRoot to create exePath.
+// Note that on Windows, exePath must end with .EXE.
 func buildForServe(ctx context.Context, pctx *processContext, moduleRoot string, exePath string) error {
-	moduleEnv := pctx.overrideEnv("GO111MODULE=on")
 
 	if wireExe, err := exec.LookPath("wire"); err == nil {
 		// TODO(light): Only run Wire if needed, but that requires source analysis.
-		wireCmd := exec.CommandContext(ctx, wireExe, "./...")
-		wireCmd.Dir = moduleRoot
-		wireCmd.Env = moduleEnv
+		wireCmd := pctx.NewCommand(ctx, moduleRoot, wireExe, "./...")
+		wireCmd.Env = append(wireCmd.Env, "GO111MODULE=on")
 		// TODO(light): Collect build logs into error.
-		wireCmd.Stdout = pctx.stderr
-		wireCmd.Stderr = pctx.stderr
 		if err := wireCmd.Run(); err != nil {
 			return xerrors.Errorf("build server: wire: %w", err)
 		}
 	}
 
-	buildCmd := exec.CommandContext(ctx, "go", "build", "-o", exePath)
-	buildCmd.Dir = moduleRoot
-	buildCmd.Env = moduleEnv
+	buildCmd := pctx.NewCommand(ctx, moduleRoot, "go", "build", "-o", exePath)
+	buildCmd.Env = append(buildCmd.Env, "GO111MODULE=on")
 	// TODO(light): Collect build logs into error.
-	buildCmd.Stdout = pctx.stderr
-	buildCmd.Stderr = pctx.stderr
 	if err := buildCmd.Run(); err != nil {
 		return xerrors.Errorf("build server: go build: %w", err)
 	}
@@ -248,14 +290,12 @@ func (alloc *serverAlloc) url(path string) *url.URL {
 
 // start starts the server process specified by the alloc and waits for
 // it to become healthy.
-func (alloc *serverAlloc) start(ctx context.Context, pctx *processContext, logger *log.Logger, workdir string) (*exec.Cmd, error) {
+func (alloc *serverAlloc) start(ctx context.Context, pctx *processContext, logger *log.Logger, workdir string, envOverrides []string) (*exec.Cmd, error) {
 	// Run server.
 	logger.Print("Starting server...")
-	process := exec.Command(alloc.exePath)
-	process.Dir = workdir
-	process.Env = pctx.overrideEnv("PORT=" + strconv.Itoa(alloc.port))
-	process.Stdout = pctx.stdout
-	process.Stderr = pctx.stderr
+	process := pctx.NewCommand(ctx, workdir, alloc.exePath)
+	process.Env = append(process.Env, envOverrides...)
+	process.Env = append(process.Env, "PORT="+strconv.Itoa(alloc.port))
 	if err := process.Start(); err != nil {
 		return nil, xerrors.Errorf("start server: %w", err)
 	}

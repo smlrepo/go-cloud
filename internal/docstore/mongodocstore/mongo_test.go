@@ -20,16 +20,19 @@ package mongodocstore
 import (
 	"context"
 	"errors"
-	"os"
+	"fmt"
 	"testing"
 	"time"
 
 	"github.com/google/go-cmp/cmp"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
 	"gocloud.dev/internal/docstore"
 	"gocloud.dev/internal/docstore/driver"
 	"gocloud.dev/internal/docstore/drivertest"
+	"gocloud.dev/internal/gcerr"
+	"gocloud.dev/internal/testing/setup"
 )
 
 const (
@@ -37,6 +40,7 @@ const (
 	dbName          = "docstore-test"
 	collectionName1 = "docstore-test-1"
 	collectionName2 = "docstore-test-2"
+	collectionName3 = "docstore-test-3"
 )
 
 type harness struct {
@@ -67,8 +71,7 @@ func (h *harness) Close() {}
 type codecTester struct{}
 
 func (codecTester) UnsupportedTypes() []drivertest.UnsupportedType {
-	return []drivertest.UnsupportedType{
-		drivertest.Complex, drivertest.NanosecondTimes}
+	return []drivertest.UnsupportedType{drivertest.NanosecondTimes}
 }
 
 func (codecTester) DocstoreEncode(x interface{}) (interface{}, error) {
@@ -109,7 +112,23 @@ func (verifyAs) CollectionCheck(coll *docstore.Collection) error {
 	return nil
 }
 
+func (verifyAs) BeforeDo(as func(i interface{}) bool) error {
+	var find *options.FindOptions
+	var insert *options.InsertOneOptions
+	var replace *options.ReplaceOptions
+	var update *options.UpdateOptions
+	var del *options.DeleteOptions
+	if !as(&find) && !as(&insert) && !as(&replace) && !as(&update) && !as(&del) {
+		return errors.New("ActionList.BeforeDo failed")
+	}
+	return nil
+}
+
 func (verifyAs) BeforeQuery(as func(i interface{}) bool) error {
+	var find *options.FindOptions
+	if !as(&find) {
+		return errors.New("Query.BeforeQuery failed")
+	}
 	return nil
 }
 
@@ -117,6 +136,19 @@ func (verifyAs) QueryCheck(it *docstore.DocumentIterator) error {
 	var c *mongo.Cursor
 	if !it.As(&c) {
 		return errors.New("DocumentIterator.As failed")
+	}
+	return nil
+}
+
+func (verifyAs) ErrorCheck(c *docstore.Collection, err error) error {
+	var cmderr mongo.CommandError
+	var bwerr mongo.BulkWriteError
+	var bwexc mongo.BulkWriteException
+	if !c.ErrorAs(err, &cmderr) && !c.ErrorAs(err, &bwerr) && !c.ErrorAs(err, &bwexc) {
+		if e, ok := err.(*gcerr.Error); ok {
+			err = e.Unwrap()
+		}
+		return fmt.Errorf("Collection.ErrorAs failed, got %T", err)
 	}
 	return nil
 }
@@ -132,6 +164,9 @@ func TestConformance(t *testing.T) {
 }
 
 func newTestClient(t *testing.T) *mongo.Client {
+	if !setup.HasDockerTestEnvironment() {
+		t.Skip("Skipping Mongo tests since the Mongo server is not available")
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	client, err := Dial(ctx, serverURI)
@@ -139,52 +174,32 @@ func newTestClient(t *testing.T) *mongo.Client {
 		t.Fatalf("dialing to %s: %v", serverURI, err)
 	}
 	if err := client.Ping(ctx, nil); err != nil {
-		if err == context.DeadlineExceeded {
-			t.Skip("could not connect to local mongoDB server (connection timed out)")
-		}
 		t.Fatalf("connecting to %s: %v", serverURI, err)
 	}
 	return client
 }
 
+func BenchmarkConformance(b *testing.B) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	client, err := Dial(ctx, serverURI)
+	if err != nil {
+		b.Fatalf("dialing to %s: %v", serverURI, err)
+	}
+	if err := client.Ping(ctx, nil); err != nil {
+		b.Fatalf("connecting to %s: %v", serverURI, err)
+	}
+	defer func() { client.Disconnect(context.Background()) }()
+
+	db := client.Database(dbName)
+	coll, err := newCollection(db.Collection(collectionName3), drivertest.KeyField, nil, nil)
+	if err != nil {
+		b.Fatal(err)
+	}
+	drivertest.RunBenchmarks(b, docstore.NewCollection(coll))
+}
+
 // Mongo-specific tests.
-
-func fakeConnectionStringInEnv() func() {
-	oldURLVal := os.Getenv("MONGO_SERVER_URL")
-	os.Setenv("MONGO_SERVER_URL", "mongodb://localhost")
-	return func() {
-		os.Setenv("MONGO_SERVER_URL", oldURLVal)
-	}
-}
-
-func TestOpenCollectionURL(t *testing.T) {
-	cleanup := fakeConnectionStringInEnv()
-	defer cleanup()
-
-	tests := []struct {
-		URL     string
-		WantErr bool
-	}{
-		// OK.
-		{"mongo://mydb/mycollection", false},
-		// Missing database name.
-		{"mongo:///mycollection", true},
-		// Missing collection name.
-		{"mongo://mydb/", true},
-		// Passing id_field parameter.
-		{"mongo://mydb/mycollection?id_field=foo", false},
-		// Invalid parameter.
-		{"mongo://mydb/mycollection?param=value", true},
-	}
-
-	ctx := context.Background()
-	for _, test := range tests {
-		_, err := docstore.OpenCollection(ctx, test.URL)
-		if (err != nil) != test.WantErr {
-			t.Errorf("%s: got error %v, want error %v", test.URL, err, test.WantErr)
-		}
-	}
-}
 
 func TestLowercaseFields(t *testing.T) {
 	// Verify that the LowercaseFields option works in all cases.
@@ -224,43 +239,42 @@ func TestLowercaseFields(t *testing.T) {
 
 	check := func(got, want interface{}) {
 		t.Helper()
-		switch w := want.(type) {
-		case S:
-			w.DocstoreRevision = got.(S).DocstoreRevision
-			want = w
-		case map[string]interface{}:
-			w["docstorerevision"] = got.(map[string]interface{})["docstorerevision"]
-			want = w
-		}
 		if !cmp.Equal(got, want) {
 			t.Errorf("\ngot  %+v\nwant %+v", got, want)
 		}
 	}
 
-	must(coll.Put(ctx, &S{ID: 1, F: 2, G: 3}))
+	sdoc := &S{ID: 1, F: 2, G: 3}
+	must(coll.Put(ctx, sdoc))
+	if sdoc.DocstoreRevision == nil {
+		t.Fatal("revision is nil")
+	}
 
 	// Get with a struct.
 	got := S{ID: 1}
 	must(coll.Get(ctx, &got))
-	check(got, S{ID: 1, F: 2, G: 3})
+	check(got, S{ID: 1, F: 2, G: 3, DocstoreRevision: sdoc.DocstoreRevision})
 
 	// Get with map.
 	got2 := map[string]interface{}{"id": 1}
 	must(coll.Get(ctx, got2))
-	check(got2, map[string]interface{}{"id": int32(1), "f": int64(2), "g": int64(3)})
+	check(got2, map[string]interface{}{"id": int64(1), "f": int64(2), "g": int64(3),
+		"docstorerevision": sdoc.DocstoreRevision})
 
 	// Field paths in Get.
 	got3 := S{ID: 1}
 	must(coll.Get(ctx, &got3, "G"))
-	check(got3, S{ID: 1, F: 0, G: 3})
+	check(got3, S{ID: 1, F: 0, G: 3, DocstoreRevision: sdoc.DocstoreRevision})
 
 	// Field paths in Update.
 	got4 := map[string]interface{}{"id": 1}
-	must(coll.Actions().Update(&S{ID: 1}, docstore.Mods{"F": 4}).Get(got4).Do(ctx))
-	check(got4, map[string]interface{}{"id": int32(1), "f": int64(4), "g": int64(3)})
+	udoc := &S{ID: 1}
+	must(coll.Actions().Update(udoc, docstore.Mods{"F": 4}).Get(got4).Do(ctx))
+	check(got4, map[string]interface{}{"id": int64(1), "f": int64(4), "g": int64(3),
+		"docstorerevision": udoc.DocstoreRevision})
 
 	// // Query filters.
 	var got5 S
 	must(coll.Query().Where("ID", "=", 1).Where("G", ">", 2).Get(ctx).Next(ctx, &got5))
-	check(got5, S{ID: 1, F: 4, G: 3})
+	check(got5, S{ID: 1, F: 4, G: 3, DocstoreRevision: udoc.DocstoreRevision})
 }
